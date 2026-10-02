@@ -28,6 +28,7 @@ build_targets = ["aarch64-linux-android"]
 [package.metadata.android.sdk]
 # AAudio, used for sound output, needs Android 8.0.
 min_sdk_version = 26
+target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "Refraktal"

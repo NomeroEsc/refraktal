@@ -3,6 +3,12 @@
 
 [advisories]
 version = 2
+ignore = [
+    # ttf-parser is unmaintained (not a known vulnerability). It reaches us via
+    # ab_glyph (our text) and winit's Linux window decorations. Revisit when
+    # ab_glyph moves to skrifa or we switch text crates.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, no vulnerability; pulled in by ab_glyph and winit" },
+]
 
 [licenses]
 version = 2
@@ -24,7 +30,9 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Our own crates depend on each other by path, which cargo-deny counts as a
+# wildcard version. Warn instead of failing.
+wildcards = "warn"
 
 [sources]
 unknown-registry = "deny"
