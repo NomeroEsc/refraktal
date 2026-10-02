@@ -1,0 +1,17 @@
+[package]
+name = "refraktal"
+description = "Open-source pattern-based music studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "refraktal"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+assert_no_alloc = "1.1.2"
+cpal = "0.18.2"
+refraktal-engine.workspace = true

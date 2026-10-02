@@ -1,0 +1,5 @@
+/target
+.envrc
+*.wav
+.DS_Store
+Thumbs.db
