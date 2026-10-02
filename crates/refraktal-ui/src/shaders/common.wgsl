@@ -15,6 +15,10 @@ struct Globals {
     tracks: vec4<u32>,     // selected track, sample-loaded mask, file hover (0/1), track count
     colors: vec4<u32>,     // x: 4-bit palette index per track
     add: vec4<f32>,        // "+" button: center x, center y, radius, visible (0/1)
+    overlay: vec4<f32>,    // help panel rect
+    overlay_info: vec4<f32>, // visible (0/1), corner radius, -, -
+    tempo_buttons: vec4<f32>, // minus x, plus x, y, radius
+    help_button: vec4<f32>,   // x, y, radius, -
 };
 
 // Linear-light neon palette.

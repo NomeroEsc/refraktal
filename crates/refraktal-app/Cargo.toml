@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "refraktal"
+path = "src/lib.rs"
+
 [[bin]]
 name = "refraktal"
 path = "src/main.rs"
@@ -20,6 +24,12 @@ refraktal-dsp.workspace = true
 refraktal-engine.workspace = true
 refraktal-io.workspace = true
 refraktal-ui.workspace = true
-rfd = "0.17.2"
 wgpu = "30"
 winit = "0.30.13"
+
+# Native file dialogs exist on desktop only.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.17.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30.13", features = ["android-native-activity"] }

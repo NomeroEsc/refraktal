@@ -11,8 +11,10 @@
 //! This crate knows nothing about audio. It receives plain data through
 //! [`FrameState`] and reports what the pointer hit through [`Layout::hit_test`].
 
+mod hud;
 mod layout;
 mod renderer;
+mod text;
 
 pub use layout::{Hit, Layout, MAX_TRACKS, Rect, STEPS};
 pub use renderer::{FrameState, Renderer};

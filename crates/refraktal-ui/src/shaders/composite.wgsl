@@ -205,7 +205,7 @@ fn draw_transport(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
     let s = g.screen.w;
     var col = col_in;
     let playing = g.play.w > 0.5;
-    let hovered = g.hover.z > 0.5;
+    let hovered = abs(g.hover.z - 1.0) < 0.5;
 
     // Play / stop button.
     let rel = p - g.play.xy;
@@ -241,6 +241,30 @@ fn draw_transport(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
     } else {
         col = mix(col, col + vec3<f32>(select(0.16, 0.32, on_beat)), fill(dd));
     }
+    // Tempo buttons and the help button.
+    col = small_button(col, p, vec2<f32>(g.tempo_buttons.x, g.tempo_buttons.z), g.tempo_buttons.w, 2.0, 1);
+    col = small_button(col, p, vec2<f32>(g.tempo_buttons.y, g.tempo_buttons.z), g.tempo_buttons.w, 3.0, 2);
+    col = small_button(col, p, g.help_button.xy, g.help_button.z, 4.0, 0);
+    return col;
+}
+
+// A round button; `icon` 1 draws a minus, 2 a plus, 0 nothing (text goes on top).
+fn small_button(col_in: vec3<f32>, p: vec2<f32>, center: vec2<f32>, r: f32, id: f32, icon: i32) -> vec3<f32> {
+    let s = g.screen.w;
+    let rel = p - center;
+    let d = length(rel) - r;
+    let hovered = abs(g.hover.z - id) < 0.5;
+    var col = mix(col_in, col_in + vec3<f32>(select(0.04, 0.11, hovered)), fill(d));
+    col += vec3<f32>(1.0) * fill(abs(d + 0.5 * s) - 0.5 * s) * select(0.2, 0.45, hovered);
+    let arm = r * 0.42;
+    var shape = 1e5;
+    if (icon >= 1) {
+        shape = sd_box(rel, vec2<f32>(arm, 0.9 * s));
+    }
+    if (icon == 2) {
+        shape = min(shape, sd_box(rel, vec2<f32>(0.9 * s, arm)));
+    }
+    col = mix(col, vec3<f32>(select(0.75, 1.2, hovered)), fill(shape));
     return col;
 }
 
@@ -260,6 +284,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     if (rect_sdf(p, g.transport, g.radii.y) < 0.0) {
         col = draw_transport(col, p);
+    }
+
+    // Help overlay: dim everything, then a large frosted panel on top.
+    if (g.overlay_info.x > 0.5) {
+        col *= 0.35;
+        col = shadow(col, p, g.overlay, g.overlay_info.y);
+        col = glass(col, p, g.overlay, g.overlay_info.y);
     }
 
     // Soft highlight roll-off instead of hard clipping.

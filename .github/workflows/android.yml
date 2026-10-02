@@ -1,0 +1,53 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+      - name: Signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            # Stable key from repository secrets: users can update in place.
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          else
+            # Throwaway key for test builds. Each build is signed differently,
+            # so installing a new one requires removing the old one first.
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.keystore" -alias refraktal \
+              -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android \
+              -dname "CN=Refraktal test build"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
+          fi
+          echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          cargo apk build -p refraktal-android --lib --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: refraktal-android
+          path: target/release/apk/refraktal.apk

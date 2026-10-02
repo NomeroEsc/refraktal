@@ -2,8 +2,19 @@
 
 An open-source, pattern-based music studio written in pure Rust.
 
-> **Status:** early prototype: a 16-step drum machine with a GPU-rendered
-> glass interface.
+> **Status:** alpha. A 16-step drum machine with a GPU-rendered glass
+> interface. Expect rough edges and file format changes.
+
+## Download
+
+Prebuilt binaries for Windows, Linux and macOS are on the
+[Releases](../../releases) page. Each release lists SHA-256 checksums in
+`SHA256SUMS.txt`.
+
+The binaries are not code-signed yet:
+
+- **Windows:** if SmartScreen warns, choose *More info → Run anyway*.
+- **macOS:** right-click the binary, choose *Open*, then confirm.
 
 ## Goals
 
@@ -12,6 +23,24 @@ An open-source, pattern-based music studio written in pure Rust.
 - Real-time safe audio engine: no allocations, locks or blocking on the
   audio thread.
 - A distinctive glass-and-neon interface rendered on the GPU.
+
+## Android
+
+Refraktal runs on Android 8.0 or newer (arm64), in landscape. Tap to edit,
+hold a track's dot to remove it, and tap **?** for help. Your beat is saved
+automatically when you leave the app. The app requests no permissions.
+
+The APK is built by GitHub Actions and attached to each release. It is
+distributed outside Google Play and without Google's developer
+verification; on devices that restrict installing such apps, use
+`adb install refraktal-*.apk`.
+
+To build it yourself you need the Android SDK and NDK, the
+`aarch64-linux-android` Rust target and `cargo install cargo-apk`, then:
+
+```sh
+cargo apk build -p refraktal-android --lib --release
+```
 
 ## Building
 
@@ -25,7 +54,8 @@ On Linux you also need the ALSA development headers
 (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora).
 
 Debug builds abort if the audio callback allocates memory, which helps
-catch real-time safety bugs early.
+catch real-time safety bugs early. Release builds on Windows open without
+a console window, so use a debug build for `--cli` there.
 
 ## Controls
 
@@ -69,8 +99,15 @@ one frame to a file and `--cli` starts the text interface.
 | `refraktal-dsp`    | oscillators, filters, drum voices               |
 | `refraktal-engine` | real-time engine, sequencer, lock-free control  |
 | `refraktal-io`     | decoding audio files (later: saving projects)   |
+| `refraktal-android` | Android entry point and app manifest          |
 | `refraktal-ui`     | wgpu renderer: backdrop, blur, glass, controls  |
-| `refraktal`        | application entry point                         |
+| `refraktal`        | the application: audio, window, input; desktop entry point |
+
+## Fonts
+
+The interface uses Chakra Petch by The Chakra Petch Project Authors,
+licensed under the SIL Open Font License 1.1
+(`crates/refraktal-ui/assets/fonts/OFL.txt`).
 
 ## License
 

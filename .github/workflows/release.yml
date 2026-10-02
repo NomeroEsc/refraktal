@@ -1,0 +1,120 @@
+name: Release
+
+# Push a tag like v0.1.0-alpha.1 to build binaries and publish a release.
+# Tags with a hyphen (alpha, beta, rc) are marked as pre-releases.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: refraktal.exe
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: refraktal
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: refraktal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install audio headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build
+        shell: bash
+        env:
+          # Replace build-machine paths in the binary with neutral ones.
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=refraktal --remap-path-prefix=${{ runner.temp }}=tmp
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="refraktal-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" README.md LICENSE "$name/"
+          cp crates/refraktal-ui/assets/fonts/OFL.txt "$name/FONT-LICENSE.txt"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  android:
+    name: Build (android-arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+      - name: Signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Set ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD secrets before releasing."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          cargo apk build -p refraktal-android --lib --release
+          cp target/release/apk/refraktal.apk "refraktal-${GITHUB_REF_NAME}-android-arm64.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: refraktal-*-android-arm64.apk
+
+  publish:
+    name: Publish release
+    needs: [build, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: CHANGELOG.md

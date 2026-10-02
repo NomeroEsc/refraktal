@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::layout::{Hit, Layout, MAX_TRACKS, STEPS};
+use crate::text::TextRenderer;
 
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Number of downsample levels in the blur chain (each halves the size).
@@ -19,7 +20,7 @@ const COMPOSITE_WGSL: &str =
     concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/composite.wgsl"));
 
 /// Everything that changes from frame to frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FrameState {
     /// Seconds since start; drives the backdrop animation.
     pub time: f32,
@@ -37,6 +38,16 @@ pub struct FrameState {
     pub sample_loaded: [bool; MAX_TRACKS],
     /// A file is being dragged over the window.
     pub file_hover: bool,
+    pub bpm: f32,
+    /// Name shown next to each track: its sound or sample file.
+    pub track_labels: Vec<String>,
+    pub help_visible: bool,
+    /// Show touch instructions instead of keyboard shortcuts.
+    pub touch: bool,
+    /// The project is saved automatically (no save shortcuts).
+    pub autosave: bool,
+    /// A short message under the sequencer and its opacity (0–1).
+    pub status: Option<(String, f32)>,
 }
 
 /// Must match `struct Globals` in `shaders/common.wgsl`.
@@ -56,6 +67,10 @@ struct Globals {
     tracks: [u32; 4],
     colors: [u32; 4],
     add: [f32; 4],
+    overlay: [f32; 4],
+    overlay_info: [f32; 4],
+    tempo_buttons: [f32; 4],
+    help_button: [f32; 4],
 }
 
 /// Must match `struct BlurParams` in `shaders/blur.wgsl`.
@@ -94,6 +109,7 @@ pub struct Renderer {
     composite_pipeline: wgpu::RenderPipeline,
     background_bind_group: wgpu::BindGroup,
     targets: Targets,
+    text: TextRenderer,
 }
 
 impl Renderer {
@@ -204,7 +220,10 @@ impl Renderer {
             height,
         );
 
+        let text = TextRenderer::new(device, target_format);
+
         Self {
+            text,
             width,
             height,
             globals,
@@ -241,7 +260,8 @@ impl Renderer {
 
     /// Record one frame into `encoder`, drawing into `target`.
     pub fn render(
-        &self,
+        &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
@@ -261,12 +281,21 @@ impl Renderer {
 
         // 3. Glass and controls.
         draw(encoder, "composite", target, &self.composite_pipeline, &self.targets.composite_bind_group);
+
+        // 4. Text on top.
+        crate::hud::queue(&mut self.text, layout, frame);
+        self.text.prepare(device, queue, self.width, self.height);
+        self.text.render(encoder, target);
     }
 
     fn globals(&self, layout: &Layout, frame: &FrameState) -> Globals {
-        let (hover_track, hover_step, hover_play, hover_add) = match frame.hover {
+        // hover.z identifies a transport button: 1 play, 2 tempo down, 3 tempo up, 4 help.
+        let (hover_track, hover_step, hover_button, hover_add) = match frame.hover {
             Hit::Step { track, step } => (track as f32, step as f32, 0.0, 0.0),
             Hit::Play => (-1.0, -1.0, 1.0, 0.0),
+            Hit::TempoDown => (-1.0, -1.0, 2.0, 0.0),
+            Hit::TempoUp => (-1.0, -1.0, 3.0, 0.0),
+            Hit::Help => (-1.0, -1.0, 4.0, 0.0),
             Hit::AddTrack => (-1.0, -1.0, 0.0, 1.0),
             Hit::Track(track) => (track as f32, -1.0, 0.0, 0.0),
             Hit::None => (-1.0, -1.0, 0.0, 0.0),
@@ -313,7 +342,7 @@ impl Renderer {
             grid: [layout.grid_origin.0, layout.grid_origin.1, layout.cell, layout.gap],
             grid2: [layout.beat_gap, layout.row_gap, layout.label_x, current],
             dots: layout.dots,
-            hover: [hover_track, hover_step, hover_play, hover_add],
+            hover: [hover_track, hover_step, hover_button, hover_add],
             pattern,
             tracks: [
                 frame.selected_track as u32,
@@ -323,6 +352,10 @@ impl Renderer {
             ],
             colors: [packed_colors, 0, 0, 0],
             add,
+            overlay: layout.help.to_array(),
+            overlay_info: [if frame.help_visible { 1.0 } else { 0.0 }, 28.0 * layout.scale, 0.0, 0.0],
+            tempo_buttons: layout.tempo_buttons,
+            help_button: [layout.help_button.0, layout.help_button.1, layout.help_button.2, 0.0],
         }
     }
 }

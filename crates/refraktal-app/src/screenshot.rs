@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use refraktal_engine::{MAX_TRACKS, default_pattern};
 use refraktal_ui::{FrameState, Hit, Layout, Renderer};
 
-pub fn run(path: &Path, width: u32, height: u32, scale: f32) -> Result<()> {
+pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, touch: bool) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         .context("no graphics adapter found")?;
@@ -32,7 +32,7 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32) -> Result<()> {
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let renderer = Renderer::new(&device, format, width, height);
+    let mut renderer = Renderer::new(&device, format, width, height);
     let track_count = 4;
     let layout = Layout::compute(width as f32, height as f32, scale, track_count);
     let mut pattern = default_pattern();
@@ -50,6 +50,12 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32) -> Result<()> {
         selected_track: 3,
         sample_loaded: std::array::from_fn(|i| i == 0 && i < MAX_TRACKS),
         file_hover: false,
+        bpm: 124.0,
+        track_labels: vec!["kick".into(), "snare".into(), "hat".into(), "clap".into()],
+        help_visible: show_help,
+        touch,
+        autosave: touch,
+        status: None,
     };
 
     // Rows in a texture-to-buffer copy must be aligned to 256 bytes.
@@ -63,7 +69,7 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32) -> Result<()> {
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
-    renderer.render(&queue, &mut encoder, &view, &layout, &frame);
+    renderer.render(&device, &queue, &mut encoder, &view, &layout, &frame);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,

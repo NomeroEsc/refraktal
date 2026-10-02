@@ -1,0 +1,41 @@
+[package]
+name = "refraktal-android"
+description = "Android build of Refraktal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# Android loads the app as a shared library.
+crate-type = ["cdylib"]
+
+[dependencies]
+refraktal.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+
+# Read by `cargo apk`. Build with:
+#   cargo apk build -p refraktal-android --lib --release
+[package.metadata.android]
+# Change this to an ID you control, e.g. io.github.<your-nick>.refraktal.
+# It cannot be changed later without users reinstalling the app.
+package = "io.github.refraktal.app"
+apk_name = "refraktal"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+# AAudio, used for sound output, needs Android 8.0.
+min_sdk_version = 26
+
+[package.metadata.android.application]
+label = "Refraktal"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[package.metadata.android.application.activity]
+orientation = "sensorLandscape"
+config_changes = "orientation|screenSize|screenLayout|keyboardHidden"
+launch_mode = "singleTask"
+
+# No permissions are requested: no network, no storage, no microphone.

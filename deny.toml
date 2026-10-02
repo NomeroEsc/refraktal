@@ -16,6 +16,8 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # Symphonia (audio decoding). MPL-2.0 is compatible with the GPL.
+    "MPL-2.0",
     "GPL-3.0-or-later",
 ]
 confidence-threshold = 0.9

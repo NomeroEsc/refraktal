@@ -4,13 +4,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use refraktal_dsp::Sample;
 use refraktal_engine::{Command, DEFAULT_TRACKS, DrumKind, Event, MAX_TRACKS, Pattern, STEPS, default_pattern};
 use refraktal_io::{PROJECT_EXTENSION, Project, TrackData};
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use refraktal_ui::{FrameState, Hit, Layout, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -20,11 +19,15 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::audio::Audio;
+use crate::dialogs::{self, Answer};
 
 const DEFAULT_BPM: f32 = 120.0;
 const MIN_BPM: f32 = 40.0;
 const MAX_BPM: f32 = 300.0;
 const BPM_STEP: f32 = 5.0;
+/// How long a status message stays, including its fade-out.
+const STATUS_TIME: Duration = Duration::from_millis(3000);
+const STATUS_FADE: Duration = Duration::from_millis(500);
 
 /// What the UI knows about one track.
 #[derive(Clone)]
@@ -46,11 +49,35 @@ struct LoadResult {
     sample: anyhow::Result<Sample>,
 }
 
-/// Open the main window and run until it is closed.
-pub fn run(audio: Audio) -> Result<()> {
+/// Platform differences the window needs to know about.
+pub struct Options {
+    /// Keep the project in this file, saving it automatically (Android).
+    pub autosave: Option<PathBuf>,
+    /// Start with touch instructions instead of keyboard shortcuts.
+    pub touch: bool,
+}
+
+/// Desktop: open the main window and run until it is closed.
+pub fn run_desktop(audio: Audio) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create the event loop")?;
+    run(audio, event_loop, Options { autosave: None, touch: false })
+}
+
+/// Run the interface on an existing event loop.
+pub fn run(audio: Audio, event_loop: EventLoop<()>, options: Options) -> Result<()> {
     let mut app = App::new(audio);
+    app.touch = options.touch;
+    if let Some(path) = options.autosave {
+        if path.exists() {
+            match Project::load(&path) {
+                Ok(project) => app.apply_project(&project),
+                Err(err) => eprintln!("Could not restore the last beat: {err:#}"),
+            }
+        }
+        app.autosave = Some(path);
+    }
     event_loop.run_app(&mut app)?;
+    app.save_autosave();
     match app.error.take() {
         Some(err) => Err(err),
         None => Ok(()),
@@ -85,6 +112,14 @@ struct App {
     dirty: bool,
     generation: u64,
     modifiers: ModifiersState,
+    help_visible: bool,
+    status: Option<(String, Instant)>,
+    autosave: Option<PathBuf>,
+    touch: bool,
+    /// Ongoing touch: finger id, when it started, where it is now, how far it moved.
+    press: Option<(u64, Instant, (f32, f32), f32)>,
+    /// Some systems also send mouse events for a tap; ignore those.
+    last_touch: Option<Instant>,
     loads_tx: Sender<LoadResult>,
     loads_rx: Receiver<LoadResult>,
     start: Instant,
@@ -114,6 +149,12 @@ impl App {
             dirty: false,
             generation: 0,
             modifiers: ModifiersState::default(),
+            help_visible: false,
+            status: None,
+            autosave: None,
+            touch: false,
+            press: None,
+            last_touch: None,
             loads_tx,
             loads_rx,
             start: Instant::now(),
@@ -141,6 +182,35 @@ impl App {
         if let Some(gpu) = &self.gpu {
             gpu.window.set_title(&self.title());
         }
+    }
+
+    /// Show a short message under the sequencer.
+    fn notify(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), Instant::now()));
+    }
+
+    fn status_for_frame(&mut self) -> Option<(String, f32)> {
+        let (message, since) = self.status.as_ref()?;
+        let age = since.elapsed();
+        if age >= STATUS_TIME {
+            self.status = None;
+            return None;
+        }
+        let remaining = (STATUS_TIME - age).as_secs_f32();
+        let alpha = (remaining / STATUS_FADE.as_secs_f32()).min(1.0);
+        Some((message.clone(), alpha))
+    }
+
+    fn track_labels(&self) -> Vec<String> {
+        self.tracks
+            .iter()
+            .map(|t| match &t.sample_path {
+                Some(path) => path
+                    .file_stem()
+                    .map_or_else(|| t.kind.name().to_owned(), |n| n.to_string_lossy().into_owned()),
+                None => t.kind.name().to_owned(),
+            })
+            .collect()
     }
 
     fn mark_dirty(&mut self) {
@@ -176,9 +246,16 @@ impl App {
     }
 
     fn click(&mut self) {
+        if self.help_visible {
+            self.help_visible = false;
+            return;
+        }
         match self.hover() {
             Hit::Play => self.toggle_play(),
             Hit::AddTrack => self.add_track(),
+            Hit::TempoDown => self.change_bpm(-BPM_STEP),
+            Hit::TempoUp => self.change_bpm(BPM_STEP),
+            Hit::Help => self.help_visible = true,
             Hit::Track(track) => {
                 // A second click on the selected track cycles its built-in sound.
                 if track == self.selected_track && !self.tracks[track].sample_loaded {
@@ -199,14 +276,78 @@ impl App {
         }
     }
 
-    /// Right click on a track marker switches the track back to its synth.
+    /// Right click (or a long press) on a track marker removes its sample,
+    /// or the track itself when it plays a built-in sound.
     fn right_click(&mut self) {
+        if self.help_visible {
+            return;
+        }
         if let Hit::Track(track) = self.hover() {
             if self.tracks[track].sample_loaded {
                 self.tracks[track].sample_loaded = false;
                 self.tracks[track].sample_path = None;
                 self.send(Command::SetSample { track, sample: None });
                 self.mark_dirty();
+                self.notify("Back to the built-in sound");
+            } else if self.tracks.len() > 1 {
+                let name = self.tracks[track].kind.name();
+                self.selected_track = track;
+                self.remove_selected_track();
+                self.notify(format!("Removed {name}"));
+            }
+        }
+    }
+
+    fn touch(&mut self, touch: winit::event::Touch) {
+        use winit::event::TouchPhase;
+        const LONG_PRESS: Duration = Duration::from_millis(450);
+        let at = (touch.location.x as f32, touch.location.y as f32);
+        self.touch = true;
+        self.last_touch = Some(Instant::now());
+        match touch.phase {
+            TouchPhase::Started => {
+                self.press = Some((touch.id, Instant::now(), at, 0.0));
+                self.cursor = Some(at);
+            }
+            TouchPhase::Moved => {
+                if let Some((id, start, last, moved)) = self.press {
+                    if id == touch.id {
+                        let step = (at.0 - last.0).hypot(at.1 - last.1);
+                        self.press = Some((id, start, at, moved + step));
+                    }
+                }
+            }
+            TouchPhase::Ended => {
+                if let Some((id, start, _, moved)) = self.press.take() {
+                    if id == touch.id && moved < 24.0 {
+                        self.cursor = Some(at);
+                        if start.elapsed() >= LONG_PRESS {
+                            self.right_click();
+                        } else {
+                            self.click();
+                        }
+                    }
+                }
+                // No hover highlight after a tap.
+                self.cursor = None;
+            }
+            TouchPhase::Cancelled => {
+                self.press = None;
+                self.cursor = None;
+            }
+        }
+    }
+
+    fn recently_touched(&self) -> bool {
+        self.last_touch.is_some_and(|t| t.elapsed() < Duration::from_millis(600))
+    }
+
+    /// Write the project to the autosave file, if this platform uses one.
+    fn save_autosave(&mut self) {
+        if let Some(path) = &self.autosave {
+            match self.to_project().save(path) {
+                Ok(()) => self.dirty = false,
+                Err(err) => eprintln!("Could not save the beat: {err:#}"),
             }
         }
     }
@@ -320,17 +461,14 @@ impl App {
         self.project_path = None;
         self.dirty = false;
         self.update_title();
+        self.notify("New project");
     }
 
     fn open_project(&mut self) {
         if !self.confirm_discard() {
             return;
         }
-        let picked = FileDialog::new()
-            .set_title("Open project")
-            .add_filter("Refraktal project", &[PROJECT_EXTENSION])
-            .pick_file();
-        if let Some(path) = picked {
+        if let Some(path) = dialogs::pick_project_to_open() {
             self.open_path(&path);
         }
     }
@@ -342,8 +480,9 @@ impl App {
                 self.project_path = Some(path.to_path_buf());
                 self.dirty = false;
                 self.update_title();
+                self.notify(format!("Opened {}", file_name(path)));
             }
-            Err(err) => show_error("Could not open the project", &err),
+            Err(err) => dialogs::show_error("Could not open the project", &err),
         }
     }
 
@@ -352,12 +491,7 @@ impl App {
         let path = match (&self.project_path, save_as) {
             (Some(path), false) => path.clone(),
             _ => {
-                let picked = FileDialog::new()
-                    .set_title("Save project")
-                    .add_filter("Refraktal project", &[PROJECT_EXTENSION])
-                    .set_file_name(format!("beat.{PROJECT_EXTENSION}"))
-                    .save_file();
-                match picked {
+                match dialogs::pick_project_to_save() {
                     Some(path) => path.with_extension(PROJECT_EXTENSION),
                     None => return false,
                 }
@@ -365,13 +499,14 @@ impl App {
         };
         match self.to_project().save(&path) {
             Ok(()) => {
+                self.notify(format!("Saved {}", file_name(&path)));
                 self.project_path = Some(path);
                 self.dirty = false;
                 self.update_title();
                 true
             }
             Err(err) => {
-                show_error("Could not save the project", &err);
+                dialogs::show_error("Could not save the project", &err);
                 false
             }
         }
@@ -380,19 +515,13 @@ impl App {
     /// Ask what to do with unsaved changes. Returns `true` if it is fine to
     /// throw the current project away.
     fn confirm_discard(&mut self) -> bool {
-        if !self.dirty {
+        if !self.dirty || self.autosave.is_some() {
             return true;
         }
-        let answer = MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title("Unsaved changes")
-            .set_description("Save changes to this project first?")
-            .set_buttons(MessageButtons::YesNoCancel)
-            .show();
-        match answer {
-            MessageDialogResult::Yes => self.save_project(false),
-            MessageDialogResult::No => true,
-            _ => false,
+        match dialogs::ask_about_unsaved_changes() {
+            Answer::Save => self.save_project(false),
+            Answer::Discard => true,
+            Answer::Cancel => false,
         }
     }
 
@@ -449,9 +578,12 @@ impl App {
                     if changed {
                         self.mark_dirty();
                     }
-                    println!("Loaded {name} on track {}", result.track + 1);
+                    self.notify(format!("Loaded {name} on track {}", result.track + 1));
                 }
-                Err(err) => eprintln!("Could not load {name}: {err:#}"),
+                Err(err) => {
+                    eprintln!("Could not load {name}: {err:#}");
+                    self.notify(format!("Could not load {name}: {err}"));
+                }
             }
         }
     }
@@ -483,12 +615,18 @@ impl App {
             playing: self.playing,
             current_step: self.current_step,
             pattern: self.pattern,
-            hover: self.hover(),
+            hover: if self.help_visible { Hit::None } else { self.hover() },
+            bpm: self.bpm,
+            track_labels: self.track_labels(),
+            help_visible: self.help_visible,
+            status: self.status_for_frame(),
             track_count: self.tracks.len(),
             colors: std::array::from_fn(|i| self.tracks.get(i).map_or(0, |t| t.color)),
             selected_track: self.selected_track,
             sample_loaded: std::array::from_fn(|i| self.tracks.get(i).is_some_and(|t| t.sample_loaded)),
             file_hover: self.file_hover,
+            touch: self.touch,
+            autosave: self.autosave.is_some(),
         };
         if let Some(gpu) = &mut self.gpu {
             gpu.render(&frame_state);
@@ -513,10 +651,14 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                if self.confirm_discard() {
+                if self.autosave.is_some() {
+                    self.save_autosave();
+                    event_loop.exit();
+                } else if self.confirm_discard() {
                     event_loop.exit();
                 }
             }
+            WindowEvent::Touch(touch) => self.touch(touch),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
@@ -537,11 +679,13 @@ impl ApplicationHandler for App {
                 self.cursor = None;
                 self.update_cursor_icon();
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                self.click();
-            }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
-                self.right_click();
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } if !self.recently_touched() => {
+                self.touch = false;
+                match button {
+                    MouseButton::Left => self.click(),
+                    MouseButton::Right => self.right_click(),
+                    _ => {}
+                }
             }
             WindowEvent::HoveredFile(_) => self.file_hover = true,
             WindowEvent::HoveredFileCancelled => self.file_hover = false,
@@ -568,6 +712,8 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match code {
+                    KeyCode::F1 => self.help_visible = !self.help_visible,
+                    KeyCode::Escape => self.help_visible = false,
                     KeyCode::Space => self.toggle_play(),
                     KeyCode::ArrowUp => self.change_bpm(BPM_STEP),
                     KeyCode::ArrowDown => self.change_bpm(-BPM_STEP),
@@ -584,6 +730,16 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+    }
+
+    /// Android destroys the window surface when the app goes to the background.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // On a phone, leaving the app should not leave the beat playing.
+        if self.autosave.is_some() && self.playing {
+            self.toggle_play();
+        }
+        self.save_autosave();
+        self.gpu = None;
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -681,7 +837,7 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        self.renderer.render(&self.queue, &mut encoder, &view, &self.layout, frame_state);
+        self.renderer.render(&self.device, &self.queue, &mut encoder, &view, &self.layout, frame_state);
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         self.queue.present(frame);
@@ -706,11 +862,7 @@ fn digit(code: KeyCode) -> Option<usize> {
     })
 }
 
-fn show_error(title: &str, err: &anyhow::Error) {
-    MessageDialog::new()
-        .set_level(MessageLevel::Error)
-        .set_title(title)
-        .set_description(format!("{err:#}"))
-        .set_buttons(MessageButtons::Ok)
-        .show();
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
