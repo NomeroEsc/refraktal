@@ -58,6 +58,7 @@ pub struct Options {
 }
 
 /// Desktop: open the main window and run until it is closed.
+#[cfg(not(target_os = "android"))]
 pub fn run_desktop(audio: Audio) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create the event loop")?;
     run(audio, event_loop, Options { autosave: None, touch: false })

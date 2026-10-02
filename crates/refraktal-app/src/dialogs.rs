@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 /// What to do with unsaved changes.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub enum Answer {
     Save,
     Discard,
