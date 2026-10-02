@@ -4,7 +4,7 @@ name: Release
 # Tags with a hyphen (alpha, beta, rc) are marked as pre-releases.
 on:
   push:
-    tags: ["v*"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: write

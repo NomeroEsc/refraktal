@@ -21,7 +21,7 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 [package.metadata.android]
 # Change this to an ID you control, e.g. io.github.<your-nick>.refraktal.
 # It cannot be changed later without users reinstalling the app.
-package = "io.github.refraktal.app"
+package = "io.github.NomeroEsc.refraktal"
 apk_name = "refraktal"
 build_targets = ["aarch64-linux-android"]
 
