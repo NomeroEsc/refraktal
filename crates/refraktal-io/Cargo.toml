@@ -1,0 +1,15 @@
+[package]
+name = "refraktal-io"
+description = "File loading and saving for Refraktal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+refraktal-dsp.workspace = true
+symphonia = { version = "0.6.1", features = ["mp3"] }
+
+[dev-dependencies]
+hound = "3.5.1"

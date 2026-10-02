@@ -6,11 +6,13 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [workspace.dependencies]
 refraktal-dsp = { path = "crates/refraktal-dsp" }
 refraktal-engine = { path = "crates/refraktal-engine" }
+refraktal-ui = { path = "crates/refraktal-ui" }
+refraktal-io = { path = "crates/refraktal-io" }
 
 [profile.dev]
 # Audio code is too slow unoptimized; keep debug info but optimize.

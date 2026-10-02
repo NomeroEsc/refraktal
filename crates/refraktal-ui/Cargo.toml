@@ -1,0 +1,11 @@
+[package]
+name = "refraktal-ui"
+description = "GPU-rendered glass interface for Refraktal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+wgpu = "30"

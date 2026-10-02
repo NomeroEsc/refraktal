@@ -24,16 +24,101 @@ pub struct Kick {
 impl Kick {
     #[must_use]
     pub fn new(sample_rate: f32) -> Self {
+        Self::tuned(sample_rate, 45.0, 180.0, 0.45, 0.08)
+    }
+
+    fn tuned(sample_rate: f32, base_hz: f32, sweep_hz: f32, decay: f32, sweep_time: f32) -> Self {
         Self {
             sample_rate,
             phase: 0.0,
             amp: 0.0,
-            amp_decay: decay_coefficient(0.45, sample_rate),
+            amp_decay: decay_coefficient(decay, sample_rate),
             sweep: 0.0,
-            sweep_decay: decay_coefficient(0.08, sample_rate),
-            base_hz: 45.0,
-            sweep_hz: 180.0,
+            sweep_decay: decay_coefficient(sweep_time, sample_rate),
+            base_hz,
+            sweep_hz,
         }
+    }
+}
+
+/// Mid tom: a higher, shorter relative of the kick.
+#[derive(Clone, Debug)]
+pub struct Tom(Kick);
+
+impl Tom {
+    #[must_use]
+    pub fn new(sample_rate: f32) -> Self {
+        Self(Kick::tuned(sample_rate, 120.0, 70.0, 0.32, 0.06))
+    }
+}
+
+impl Voice for Tom {
+    fn trigger(&mut self, velocity: f32) {
+        self.0.trigger(velocity);
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        self.0.next_sample() * 0.8
+    }
+}
+
+/// Hand clap: three quick noise bursts followed by a short tail.
+#[derive(Clone, Debug)]
+pub struct Clap {
+    sample_rate: f32,
+    noise: Noise,
+    filter: OnePoleHighpass,
+    velocity: f32,
+    /// Samples since the trigger; `None` when silent.
+    elapsed: Option<u32>,
+    tail: f32,
+    tail_decay: f32,
+}
+
+impl Clap {
+    #[must_use]
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            noise: Noise::new(0x5EED_0003),
+            filter: OnePoleHighpass::new(1000.0, sample_rate),
+            velocity: 0.0,
+            elapsed: None,
+            tail: 0.0,
+            tail_decay: decay_coefficient(0.18, sample_rate),
+        }
+    }
+}
+
+impl Voice for Clap {
+    fn trigger(&mut self, velocity: f32) {
+        self.velocity = velocity.clamp(0.0, 1.0);
+        self.elapsed = Some(0);
+        self.tail = 0.0;
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        let Some(n) = self.elapsed else {
+            return 0.0;
+        };
+        let t = n as f32 / self.sample_rate;
+        let burst_len = 0.011;
+        let amp = if t < 3.0 * burst_len {
+            // Each burst starts loud and decays quickly.
+            (-(t % burst_len) / 0.0025).exp()
+        } else {
+            if self.tail == 0.0 {
+                self.tail = 0.8;
+            }
+            self.tail *= self.tail_decay;
+            self.tail
+        };
+        if t >= 3.0 * burst_len && self.tail < SILENCE {
+            self.elapsed = None;
+            return 0.0;
+        }
+        self.elapsed = Some(n + 1);
+        self.filter.process(self.noise.sample()) * amp * self.velocity
     }
 }
 
@@ -168,6 +253,8 @@ mod tests {
             ("kick", render(&mut Kick::new(sr), two_seconds)),
             ("snare", render(&mut Snare::new(sr), two_seconds)),
             ("hat", render(&mut Hat::new(sr), two_seconds)),
+            ("clap", render(&mut Clap::new(sr), two_seconds)),
+            ("tom", render(&mut Tom::new(sr), two_seconds)),
         ] {
             assert!(peak > 0.05, "{name} is too quiet: {peak}");
             assert!(peak <= 1.5, "{name} is too loud: {peak}");

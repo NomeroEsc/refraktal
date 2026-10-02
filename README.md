@@ -2,9 +2,8 @@
 
 An open-source, pattern-based music studio written in pure Rust.
 
-> **Status:** early prototype. Right now Refraktal is a command-line drum
-> machine used to develop the audio engine. The graphical interface comes
-> later.
+> **Status:** early prototype: a 16-step drum machine with a GPU-rendered
+> glass interface.
 
 ## Goals
 
@@ -28,7 +27,24 @@ On Linux you also need the ALSA development headers
 Debug builds abort if the audio callback allocates memory, which helps
 catch real-time safety bugs early.
 
-## Prototype commands
+## Controls
+
+| Input                 | Action                    |
+|-----------------------|---------------------------|
+| click a cell          | toggle that step          |
+| click ▶ / `Space`     | start or stop             |
+| `↑` / `↓`             | tempo ±5 BPM              |
+| click a track dot / `1`–`8` | select and preview a track |
+| click the selected dot again | switch its built-in sound (kick, snare, hat, clap, tom) |
+| click `+` / `+` key   | add a track (up to 8)     |
+| `Delete` / `Backspace` | remove the selected track |
+| drop an audio file    | play it on the selected track (WAV, FLAC, MP3, OGG) |
+| right-click a track dot | back to the built-in sound |
+
+Run `cargo run -- --help` for options, e.g. `--screenshot shot.png` renders
+one frame to a file and `--cli` starts the text interface.
+
+## Text interface commands
 
 | Command            | Action                              |
 |--------------------|-------------------------------------|
@@ -45,6 +61,8 @@ catch real-time safety bugs early.
 |--------------------|-------------------------------------------------|
 | `refraktal-dsp`    | oscillators, filters, drum voices               |
 | `refraktal-engine` | real-time engine, sequencer, lock-free control  |
+| `refraktal-io`     | decoding audio files (later: saving projects)   |
+| `refraktal-ui`     | wgpu renderer: backdrop, blur, glass, controls  |
 | `refraktal`        | application entry point                         |
 
 ## License

@@ -7,10 +7,12 @@
 mod drums;
 mod filter;
 mod noise;
+mod sampler;
 
-pub use drums::{Hat, Kick, Snare};
+pub use drums::{Clap, Hat, Kick, Snare, Tom};
 pub use filter::OnePoleHighpass;
 pub use noise::Noise;
+pub use sampler::{Sample, SampleVoice};
 
 /// A sound source that can be triggered and rendered sample by sample.
 pub trait Voice {
