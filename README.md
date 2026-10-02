@@ -38,6 +38,13 @@ catch real-time safety bugs early.
 | click the selected dot again | switch its built-in sound (kick, snare, hat, clap, tom) |
 | click `+` / `+` key   | add a track (up to 8)     |
 | `Delete` / `Backspace` | remove the selected track |
+| `Ctrl+S` / `Ctrl+Shift+S` | save / save as         |
+| `Ctrl+O`, or drop a `.refraktal` file | open a project |
+| `Ctrl+N`              | new project               |
+
+Projects are small JSON files (`.refraktal`). Samples are referenced by
+path, relative to the project file when they live in the same folder, so
+keep samples next to the project if you want to move or share it.
 | drop an audio file    | play it on the selected track (WAV, FLAC, MP3, OGG) |
 | right-click a track dot | back to the built-in sound |
 

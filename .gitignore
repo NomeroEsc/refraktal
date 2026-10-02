@@ -3,3 +3,5 @@
 *.wav
 .DS_Store
 Thumbs.db
+*.png
+*.refraktal.tmp

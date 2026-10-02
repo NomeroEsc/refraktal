@@ -25,7 +25,8 @@ pub const MAX_TRACKS: usize = 8;
 /// Tracks in a new project.
 pub const DEFAULT_TRACKS: [DrumKind; 3] = [DrumKind::Kick, DrumKind::Snare, DrumKind::Hat];
 
-const QUEUE_CAPACITY: usize = 256;
+// Large enough to load a whole project (8 tracks × 16 steps) in one go.
+const QUEUE_CAPACITY: usize = 1024;
 const RETIRE_CAPACITY: usize = 64;
 const MIN_BPM: f32 = 20.0;
 const MAX_BPM: f32 = 999.0;
@@ -91,6 +92,9 @@ pub enum Command {
     Stop,
     SetBpm(f32),
     ToggleStep { track: usize, step: usize },
+    SetStep { track: usize, step: usize, on: bool },
+    /// Start over with a single empty track, e.g. before loading a project.
+    Reset(DrumKind),
     /// Add a track at the end, if there is room.
     AddTrack(DrumKind),
     /// Remove a track; the ones below move up. The last track cannot be removed.
@@ -312,6 +316,22 @@ impl Engine {
                     }
                 }
             }
+            Command::SetStep { track, step, on } => {
+                if track < self.track_count {
+                    if let Some(cell) = self.pattern[track].get_mut(step) {
+                        *cell = on;
+                    }
+                }
+            }
+            Command::Reset(kind) => {
+                for track in &mut self.tracks {
+                    let old = track.sample.take();
+                    retire(&mut self.retired, old);
+                }
+                self.tracks[0] = Track::new(kind, self.sample_rate);
+                self.track_count = 1;
+                self.pattern = [[false; STEPS]; MAX_TRACKS];
+            }
             Command::SetSample { track, sample } => {
                 if track < self.track_count {
                     let t = &mut self.tracks[track];
@@ -530,5 +550,21 @@ mod tests {
         }
         engine.process(&mut buf, 2);
         assert_eq!(engine.track_count, 1);
+    }
+
+    #[test]
+    fn reset_then_rebuild() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        let mut buf = vec![0.0; 64];
+        handle.send(Command::SetSample { track: 0, sample: Some(constant_sample(0.1, 10)) }).unwrap();
+        handle.send(Command::Reset(DrumKind::Tom)).unwrap();
+        handle.send(Command::AddTrack(DrumKind::Clap)).unwrap();
+        handle.send(Command::SetStep { track: 1, step: 3, on: true }).unwrap();
+        engine.process(&mut buf, 2);
+        assert_eq!(engine.track_count, 2);
+        assert_eq!(engine.tracks[0].kind, DrumKind::Tom);
+        assert!(engine.pattern[1][3]);
+        assert!(!engine.pattern[0][0]);
+        assert_eq!(handle.collect_garbage(), 1);
     }
 }

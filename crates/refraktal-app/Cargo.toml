@@ -20,5 +20,6 @@ refraktal-dsp.workspace = true
 refraktal-engine.workspace = true
 refraktal-io.workspace = true
 refraktal-ui.workspace = true
+rfd = "0.17.2"
 wgpu = "30"
 winit = "0.30.13"

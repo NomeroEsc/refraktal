@@ -9,12 +9,14 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use refraktal_dsp::Sample;
 use refraktal_engine::{Command, DEFAULT_TRACKS, DrumKind, Event, MAX_TRACKS, Pattern, STEPS, default_pattern};
+use refraktal_io::{PROJECT_EXTENSION, Project, TrackData};
+use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use refraktal_ui::{FrameState, Hit, Layout, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::audio::Audio;
@@ -25,16 +27,20 @@ const MAX_BPM: f32 = 300.0;
 const BPM_STEP: f32 = 5.0;
 
 /// What the UI knows about one track.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TrackState {
     kind: DrumKind,
     sample_loaded: bool,
+    /// File the loaded sample came from, saved with the project.
+    sample_path: Option<PathBuf>,
     /// Palette index; stays with the track when others are added or removed.
     color: u8,
 }
 
 /// Result of decoding a dropped file on a loader thread.
 struct LoadResult {
+    /// Project generation the load was started for; stale results are ignored.
+    generation: u64,
     track: usize,
     path: PathBuf,
     sample: anyhow::Result<Sample>,
@@ -75,6 +81,10 @@ struct App {
     selected_track: usize,
     tracks: Vec<TrackState>,
     file_hover: bool,
+    project_path: Option<PathBuf>,
+    dirty: bool,
+    generation: u64,
+    modifiers: ModifiersState,
     loads_tx: Sender<LoadResult>,
     loads_rx: Receiver<LoadResult>,
     start: Instant,
@@ -97,9 +107,13 @@ impl App {
             tracks: DEFAULT_TRACKS
                 .iter()
                 .enumerate()
-                .map(|(i, &kind)| TrackState { kind, sample_loaded: false, color: i as u8 })
+                .map(|(i, &kind)| TrackState { kind, sample_loaded: false, sample_path: None, color: i as u8 })
                 .collect(),
             file_hover: false,
+            project_path: None,
+            dirty: false,
+            generation: 0,
+            modifiers: ModifiersState::default(),
             loads_tx,
             loads_rx,
             start: Instant::now(),
@@ -114,7 +128,26 @@ impl App {
     }
 
     fn title(&self) -> String {
-        format!("Refraktal – {:.0} BPM", self.bpm)
+        let name = self
+            .project_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .map_or_else(|| "Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
+        let mark = if self.dirty { " *" } else { "" };
+        format!("Refraktal – {name}{mark} – {:.0} BPM", self.bpm)
+    }
+
+    fn update_title(&self) {
+        if let Some(gpu) = &self.gpu {
+            gpu.window.set_title(&self.title());
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        if !self.dirty {
+            self.dirty = true;
+            self.update_title();
+        }
     }
 
     fn toggle_play(&mut self) {
@@ -131,9 +164,8 @@ impl App {
     fn change_bpm(&mut self, delta: f32) {
         self.bpm = (self.bpm + delta).clamp(MIN_BPM, MAX_BPM);
         self.send(Command::SetBpm(self.bpm));
-        if let Some(gpu) = &self.gpu {
-            gpu.window.set_title(&self.title());
-        }
+        self.dirty = true;
+        self.update_title();
     }
 
     fn hover(&self) -> Hit {
@@ -153,6 +185,7 @@ impl App {
                     let kind = self.tracks[track].kind.next();
                     self.tracks[track].kind = kind;
                     self.send(Command::SetDrum { track, kind });
+                    self.mark_dirty();
                 }
                 self.selected_track = track;
                 self.send(Command::Trigger(track));
@@ -160,6 +193,7 @@ impl App {
             Hit::Step { track, step } => {
                 self.pattern[track][step] = !self.pattern[track][step];
                 self.send(Command::ToggleStep { track, step });
+                self.mark_dirty();
             }
             Hit::None => {}
         }
@@ -170,7 +204,9 @@ impl App {
         if let Hit::Track(track) = self.hover() {
             if self.tracks[track].sample_loaded {
                 self.tracks[track].sample_loaded = false;
+                self.tracks[track].sample_path = None;
                 self.send(Command::SetSample { track, sample: None });
+                self.mark_dirty();
             }
         }
     }
@@ -188,11 +224,12 @@ impl App {
             .find(|c| self.tracks.iter().all(|t| t.color != *c))
             .unwrap_or(0);
         let index = self.tracks.len();
-        self.tracks.push(TrackState { kind, sample_loaded: false, color });
+        self.tracks.push(TrackState { kind, sample_loaded: false, sample_path: None, color });
         self.pattern[index] = [false; STEPS];
         self.send(Command::AddTrack(kind));
         self.send(Command::Trigger(index));
         self.selected_track = index;
+        self.mark_dirty();
         self.relayout();
     }
 
@@ -207,7 +244,156 @@ impl App {
         self.pattern[count - 1] = [false; STEPS];
         self.send(Command::RemoveTrack(index));
         self.selected_track = index.min(self.tracks.len() - 1);
+        self.mark_dirty();
         self.relayout();
+    }
+
+    fn to_project(&self) -> Project {
+        Project {
+            bpm: self.bpm,
+            tracks: self
+                .tracks
+                .iter()
+                .zip(self.pattern.iter())
+                .map(|(t, steps)| TrackData {
+                    sound: t.kind.name().to_owned(),
+                    color: t.color,
+                    steps: *steps,
+                    sample: t.sample_path.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Replace everything with `project`. Samples load in the background.
+    fn apply_project(&mut self, project: &Project) {
+        self.generation += 1;
+        self.send(Command::Stop);
+        self.playing = false;
+        self.current_step = None;
+
+        let kind_of = |t: &TrackData| DrumKind::from_name(&t.sound).unwrap_or(DrumKind::Kick);
+        self.pattern = [[false; STEPS]; MAX_TRACKS];
+        self.tracks.clear();
+        for (index, data) in project.tracks.iter().take(MAX_TRACKS).enumerate() {
+            let kind = kind_of(data);
+            self.send(if index == 0 { Command::Reset(kind) } else { Command::AddTrack(kind) });
+            self.tracks.push(TrackState { kind, sample_loaded: false, sample_path: None, color: data.color });
+            for (step, &on) in data.steps.iter().enumerate() {
+                if on {
+                    self.pattern[index][step] = true;
+                    self.send(Command::SetStep { track: index, step, on });
+                }
+            }
+        }
+        self.bpm = project.bpm.clamp(MIN_BPM, MAX_BPM);
+        self.send(Command::SetBpm(self.bpm));
+
+        for (index, data) in project.tracks.iter().enumerate() {
+            if let Some(path) = &data.sample {
+                self.load_sample_into(index, path.clone());
+            }
+        }
+        self.selected_track = 0;
+        self.relayout();
+    }
+
+    fn new_project(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        let pattern = default_pattern();
+        let project = Project {
+            bpm: DEFAULT_BPM,
+            tracks: DEFAULT_TRACKS
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| TrackData {
+                    sound: kind.name().to_owned(),
+                    color: i as u8,
+                    steps: pattern[i],
+                    sample: None,
+                })
+                .collect(),
+        };
+        self.apply_project(&project);
+        self.project_path = None;
+        self.dirty = false;
+        self.update_title();
+    }
+
+    fn open_project(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        let picked = FileDialog::new()
+            .set_title("Open project")
+            .add_filter("Refraktal project", &[PROJECT_EXTENSION])
+            .pick_file();
+        if let Some(path) = picked {
+            self.open_path(&path);
+        }
+    }
+
+    fn open_path(&mut self, path: &std::path::Path) {
+        match Project::load(path) {
+            Ok(project) => {
+                self.apply_project(&project);
+                self.project_path = Some(path.to_path_buf());
+                self.dirty = false;
+                self.update_title();
+            }
+            Err(err) => show_error("Could not open the project", &err),
+        }
+    }
+
+    /// Save to the current file, or ask for one. Returns `true` on success.
+    fn save_project(&mut self, save_as: bool) -> bool {
+        let path = match (&self.project_path, save_as) {
+            (Some(path), false) => path.clone(),
+            _ => {
+                let picked = FileDialog::new()
+                    .set_title("Save project")
+                    .add_filter("Refraktal project", &[PROJECT_EXTENSION])
+                    .set_file_name(format!("beat.{PROJECT_EXTENSION}"))
+                    .save_file();
+                match picked {
+                    Some(path) => path.with_extension(PROJECT_EXTENSION),
+                    None => return false,
+                }
+            }
+        };
+        match self.to_project().save(&path) {
+            Ok(()) => {
+                self.project_path = Some(path);
+                self.dirty = false;
+                self.update_title();
+                true
+            }
+            Err(err) => {
+                show_error("Could not save the project", &err);
+                false
+            }
+        }
+    }
+
+    /// Ask what to do with unsaved changes. Returns `true` if it is fine to
+    /// throw the current project away.
+    fn confirm_discard(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let answer = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description("Save changes to this project first?")
+            .set_buttons(MessageButtons::YesNoCancel)
+            .show();
+        match answer {
+            MessageDialogResult::Yes => self.save_project(false),
+            MessageDialogResult::No => true,
+            _ => false,
+        }
     }
 
     fn relayout(&mut self) {
@@ -222,11 +408,22 @@ impl App {
 
     /// Decode a dropped file on a background thread so the window stays smooth.
     fn load_file(&mut self, path: PathBuf) {
-        let track = self.selected_track;
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+            // A project dropped on the window opens it.
+            if self.confirm_discard() {
+                self.open_path(&path);
+            }
+            return;
+        }
+        self.load_sample_into(self.selected_track, path);
+    }
+
+    fn load_sample_into(&mut self, track: usize, path: PathBuf) {
+        let generation = self.generation;
         let tx = self.loads_tx.clone();
         std::thread::spawn(move || {
             let sample = refraktal_io::load_sample(&path);
-            let _ = tx.send(LoadResult { track, path, sample });
+            let _ = tx.send(LoadResult { generation, track, path, sample });
         });
     }
 
@@ -236,16 +433,22 @@ impl App {
                 || result.path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            if result.track >= self.tracks.len() {
-                continue; // the track was removed while the file was loading
+            if result.generation != self.generation || result.track >= self.tracks.len() {
+                continue; // another project was opened, or the track was removed
             }
             match result.sample {
                 Ok(sample) => {
-                    self.tracks[result.track].sample_loaded = true;
+                    let track = &mut self.tracks[result.track];
+                    let changed = track.sample_path.as_deref() != Some(result.path.as_path());
+                    track.sample_loaded = true;
+                    track.sample_path = Some(result.path.clone());
                     self.send(Command::SetSample {
                         track: result.track,
                         sample: Some(Arc::new(sample)),
                     });
+                    if changed {
+                        self.mark_dirty();
+                    }
                     println!("Loaded {name} on track {}", result.track + 1);
                 }
                 Err(err) => eprintln!("Could not load {name}: {err:#}"),
@@ -309,7 +512,12 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.confirm_discard() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size);
@@ -344,21 +552,33 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
-                match event.logical_key {
-                    Key::Named(NamedKey::Space) => self.toggle_play(),
-                    Key::Named(NamedKey::ArrowUp) => self.change_bpm(BPM_STEP),
-                    Key::Named(NamedKey::ArrowDown) => self.change_bpm(-BPM_STEP),
-                    Key::Named(NamedKey::Delete | NamedKey::Backspace) => self.remove_selected_track(),
-                    Key::Character(ref c) => {
-                        let count = self.tracks.len();
-                        if let Some(track) = c.parse::<usize>().ok().filter(|n| (1..=count).contains(n)) {
+                // Physical keys, so shortcuts work with any keyboard layout.
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                if self.modifiers.control_key() || self.modifiers.super_key() {
+                    match code {
+                        KeyCode::KeyS => {
+                            self.save_project(self.modifiers.shift_key());
+                        }
+                        KeyCode::KeyO => self.open_project(),
+                        KeyCode::KeyN => self.new_project(),
+                        _ => {}
+                    }
+                    return;
+                }
+                match code {
+                    KeyCode::Space => self.toggle_play(),
+                    KeyCode::ArrowUp => self.change_bpm(BPM_STEP),
+                    KeyCode::ArrowDown => self.change_bpm(-BPM_STEP),
+                    KeyCode::Delete | KeyCode::Backspace => self.remove_selected_track(),
+                    KeyCode::Equal | KeyCode::NumpadAdd => self.add_track(),
+                    _ => {
+                        if let Some(track) = digit(code).filter(|&n| (1..=self.tracks.len()).contains(&n)) {
                             self.selected_track = track - 1;
                             self.send(Command::Trigger(track - 1));
-                        } else if c.as_str() == "+" || c.as_str() == "=" {
-                            self.add_track();
                         }
                     }
-                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
@@ -470,4 +690,27 @@ impl Gpu {
             self.surface.configure(&self.device, &self.config);
         }
     }
+}
+
+fn digit(code: KeyCode) -> Option<usize> {
+    Some(match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => 1,
+        KeyCode::Digit2 | KeyCode::Numpad2 => 2,
+        KeyCode::Digit3 | KeyCode::Numpad3 => 3,
+        KeyCode::Digit4 | KeyCode::Numpad4 => 4,
+        KeyCode::Digit5 | KeyCode::Numpad5 => 5,
+        KeyCode::Digit6 | KeyCode::Numpad6 => 6,
+        KeyCode::Digit7 | KeyCode::Numpad7 => 7,
+        KeyCode::Digit8 | KeyCode::Numpad8 => 8,
+        _ => return None,
+    })
+}
+
+fn show_error(title: &str, err: &anyhow::Error) {
+    MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title(title)
+        .set_description(format!("{err:#}"))
+        .set_buttons(MessageButtons::Ok)
+        .show();
 }
