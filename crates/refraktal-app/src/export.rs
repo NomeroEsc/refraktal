@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use refraktal_dsp::Sample;
-use refraktal_engine::{Command, DrumKind, Engine, MAX_TRACKS, STEPS};
-use refraktal_io::Project;
+use refraktal_engine::{Command, DrumKind, Engine, STEPS};
+use refraktal_io::{Instrument, Project};
 
 use crate::gui::{MAX_BPM, MIN_BPM};
 
 /// Sample rate of exported audio.
 pub const EXPORT_SAMPLE_RATE: u32 = 48_000;
-/// How many times the pattern plays in an export.
+/// How many times the selected pattern plays in an export.
 pub const EXPORT_LOOPS: usize = 4;
 /// Sounds still ringing after the last loop get at most this long.
 const MAX_TAIL_SECONDS: f32 = 5.0;
@@ -59,9 +59,11 @@ impl Rendered {
     }
 }
 
-/// The built-in sound a saved track asks for. Unknown names play a kick.
-pub fn drum_kind(sound: &str) -> DrumKind {
-    DrumKind::from_name(sound).unwrap_or(DrumKind::Kick)
+/// The engine voice for an instrument. Unknown drum names play a kick.
+pub fn drum_kind(instrument: &Instrument) -> DrumKind {
+    match instrument {
+        Instrument::Drum { sound } => DrumKind::from_name(sound).unwrap_or(DrumKind::Kick),
+    }
 }
 
 /// Tempo of a saved project, limited to what the interface allows.
@@ -69,20 +71,22 @@ pub fn project_bpm(project: &Project) -> f32 {
     project.bpm.clamp(MIN_BPM, MAX_BPM)
 }
 
-/// Commands that rebuild `project` in an engine: tracks, steps and tempo.
-/// Samples are not included; they are decoded separately.
+/// Commands that rebuild `project` in an engine: tracks, every pattern's
+/// steps, tempo and the selected pattern. Samples are not included; they
+/// are decoded separately. The engine's track and pattern indices then
+/// match the project's.
 pub fn project_commands(project: &Project) -> Vec<Command> {
-    let mut commands = Vec::new();
-    for (track, data) in project.tracks.iter().take(MAX_TRACKS).enumerate() {
-        let kind = drum_kind(&data.sound);
-        commands.push(if track == 0 { Command::Reset(kind) } else { Command::AddTrack(kind) });
-        for (step, &on) in data.steps.iter().enumerate() {
-            if on {
-                commands.push(Command::SetStep { track, step, on });
+    let mut commands = vec![Command::Reset];
+    commands.extend(project.tracks.iter().map(|t| Command::AddTrack(drum_kind(&t.instrument))));
+    for (pattern, data) in project.patterns.iter().enumerate() {
+        for (track, steps) in data.steps.iter().enumerate() {
+            if let Some(steps) = steps.filter(|s| s.contains(&true)) {
+                commands.push(Command::SetRow { pattern, track, steps });
             }
         }
     }
     commands.push(Command::SetBpm(project_bpm(project)));
+    commands.push(Command::SelectPattern(project.selected_pattern));
     commands
 }
 
@@ -102,16 +106,15 @@ pub fn load_samples(project: &Project) -> Result<Vec<Option<Arc<Sample>>>> {
         .collect()
 }
 
-/// Render `project`: the pattern [`EXPORT_LOOPS`] times, then whatever is
-/// still ringing. `samples[i]` replaces the built-in sound of track `i`.
+/// Render `project`: its selected pattern [`EXPORT_LOOPS`] times, then
+/// whatever is still ringing. `samples[i]` replaces the sound of track `i`.
 #[must_use]
 pub fn render(project: &Project, samples: &[Option<Arc<Sample>>]) -> Rendered {
     let sample_rate = EXPORT_SAMPLE_RATE as f32;
     let (mut engine, mut handle) = Engine::new(sample_rate);
 
     let mut commands = project_commands(project);
-    let track_count = project.tracks.len().min(MAX_TRACKS);
-    for (track, sample) in samples.iter().enumerate().take(track_count) {
+    for (track, sample) in samples.iter().enumerate().take(project.tracks.len()) {
         if let Some(sample) = sample {
             commands.push(Command::SetSample { track, sample: Some(Arc::clone(sample)) });
         }
@@ -189,30 +192,29 @@ pub fn export_file(project_path: &Path, wav_path: &Path) -> Result<Rendered> {
 
 #[cfg(test)]
 mod tests {
-    use refraktal_engine::default_pattern;
-    use refraktal_io::TrackData;
+    use refraktal_io::{Steps, TrackData};
 
     use super::*;
 
-    fn project(bpm: f32, tracks: &[(&str, [bool; STEPS])]) -> Project {
-        Project {
-            bpm,
-            tracks: tracks
-                .iter()
-                .enumerate()
-                .map(|(i, (sound, steps))| TrackData {
-                    sound: (*sound).to_owned(),
-                    color: i as u8,
-                    steps: *steps,
-                    sample: None,
-                })
-                .collect(),
+    /// One pattern with these tracks and steps.
+    fn project(bpm: f32, tracks: &[(&str, Steps)]) -> Project {
+        let mut p = Project::new();
+        p.bpm = bpm;
+        for (i, (sound, steps)) in tracks.iter().enumerate() {
+            let track = p.add_track(0, TrackData::new(Instrument::drum(sound), i as u8)).unwrap();
+            for (step, &on) in steps.iter().enumerate() {
+                p.set_step(0, track, step, on);
+            }
         }
+        p
     }
 
     fn default_project() -> Project {
-        let p = default_pattern();
-        project(120.0, &[("kick", p[0]), ("snare", p[1]), ("hat", p[2])])
+        Project::demo()
+    }
+
+    fn kick_on_beats() -> Steps {
+        std::array::from_fn(|i| i % 4 == 0)
     }
 
     fn only_first_step() -> [bool; STEPS] {
@@ -242,8 +244,7 @@ mod tests {
 
     #[test]
     fn odd_tempos_keep_the_bar_length() {
-        let p = default_pattern();
-        let r = render(&project(97.3, &[("kick", p[0])]), &[]);
+        let r = render(&project(97.3, &[("kick", kick_on_beats())]), &[]);
         let expected = EXPORT_LOOPS as f64 * STEPS as f64 * 48_000.0 * 60.0 / 97.3 / 4.0;
         assert!((r.loop_frames as f64 - expected).abs() <= 1.0, "{} vs {expected}", r.loop_frames);
     }
@@ -299,6 +300,27 @@ mod tests {
         let bytes = std::fs::read(&wav_path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(bytes.len(), 44 + r.audio.len() * 2);
+    }
+
+    #[test]
+    fn the_selected_pattern_is_exported() {
+        let mut p = project(120.0, &[("kick", only_first_step())]);
+        let second = p.add_pattern().unwrap();
+        p.set_step(second, 0, 8, true);
+        let samples = [constant(0.5, 100)];
+
+        let first = render(&p, &samples);
+        assert!(frame(&first, 0)[0] > 0.1 && frame(&first, 8 * 6000)[0] == 0.0);
+        p.selected_pattern = second;
+        let other = render(&p, &samples);
+        assert!(frame(&other, 0)[0] == 0.0 && frame(&other, 8 * 6000)[0] > 0.1);
+    }
+
+    #[test]
+    fn an_empty_project_exports_silence() {
+        let r = render(&Project::new(), &[]);
+        assert_eq!(r.loop_frames, EXPORT_LOOPS * STEPS * 6000);
+        assert!(r.audio.iter().all(|&s| s == 0.0));
     }
 
     #[test]

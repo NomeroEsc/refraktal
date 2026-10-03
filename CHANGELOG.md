@@ -5,6 +5,15 @@
 - Export a project to WAV (48 kHz, 16-bit stereo) from the command line:
   `refraktal --export beat.refraktal beat.wav`. The pattern plays four times,
   then the last hits ring out. Exports sound exactly like playback.
+- Patterns: up to 16 per project. Tracks can be shared by every pattern
+  (the default) or belong to one pattern each; switching keeps the beat.
+  While playing, a newly selected pattern starts at the next bar. For now
+  patterns are managed from the text interface (`--cli`); the new screen
+  comes next.
+- Up to 32 tracks per project, 8 per pattern.
+- Project files are now version 2 (instruments, patterns). Older files open
+  and are upgraded when saved; older versions of Refraktal cannot open
+  version 2 files.
 
 ## 0.1.0-alpha.1
 

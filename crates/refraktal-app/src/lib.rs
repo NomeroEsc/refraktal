@@ -20,10 +20,14 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use anyhow::Result;
 
-// The UI and the engine must agree on the grid size.
+// The project model, the engine and the screen must agree on sizes. The
+// screen shows one pattern, so its row count is the per-pattern limit.
 const _: () = assert!(
     refraktal_ui::STEPS == refraktal_engine::STEPS
-        && refraktal_ui::MAX_TRACKS == refraktal_engine::MAX_TRACKS
+        && refraktal_io::STEPS == refraktal_engine::STEPS
+        && refraktal_io::MAX_TRACKS == refraktal_engine::MAX_TRACKS
+        && refraktal_io::MAX_PATTERNS == refraktal_engine::MAX_PATTERNS
+        && refraktal_ui::MAX_TRACKS == refraktal_io::MAX_PATTERN_TRACKS
 );
 
 #[cfg(not(target_os = "android"))]

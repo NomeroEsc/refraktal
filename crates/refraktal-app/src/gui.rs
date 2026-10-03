@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use refraktal_dsp::Sample;
-use refraktal_engine::{Command, DEFAULT_TRACKS, DrumKind, Event, MAX_TRACKS, Pattern, STEPS, default_pattern};
-use refraktal_io::{PROJECT_EXTENSION, Project, TrackData};
-use refraktal_ui::{FrameState, Hit, Layout, Renderer};
+use refraktal_engine::{Command, DrumKind, Event, STEPS};
+use refraktal_io::{Instrument, PROJECT_EXTENSION, Project, TrackData};
+use refraktal_ui::{FrameState, Hit, Layout, MAX_TRACKS as MAX_ROWS, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -22,24 +22,12 @@ use crate::audio::Audio;
 use crate::dialogs::{self, Answer};
 use crate::export;
 
-const DEFAULT_BPM: f32 = 120.0;
 pub(crate) const MIN_BPM: f32 = 40.0;
 pub(crate) const MAX_BPM: f32 = 300.0;
 const BPM_STEP: f32 = 5.0;
 /// How long a status message stays, including its fade-out.
 const STATUS_TIME: Duration = Duration::from_millis(3000);
 const STATUS_FADE: Duration = Duration::from_millis(500);
-
-/// What the UI knows about one track.
-#[derive(Clone)]
-struct TrackState {
-    kind: DrumKind,
-    sample_loaded: bool,
-    /// File the loaded sample came from, saved with the project.
-    sample_path: Option<PathBuf>,
-    /// Palette index; stays with the track when others are added or removed.
-    color: u8,
-}
 
 /// Result of decoding a dropped file on a loader thread.
 struct LoadResult {
@@ -72,7 +60,7 @@ pub fn run(audio: Audio, event_loop: EventLoop<()>, options: Options) -> Result<
     if let Some(path) = options.autosave {
         if path.exists() {
             match Project::load(&path) {
-                Ok(project) => app.apply_project(&project),
+                Ok(project) => app.apply_project(project),
                 Err(err) => eprintln!("Could not restore the last beat: {err:#}"),
             }
         }
@@ -101,14 +89,16 @@ struct App {
     /// Keeps the audio stream alive for as long as the window is open.
     audio: Audio,
     gpu: Option<Gpu>,
-    pattern: Pattern,
+    /// The document. The engine mirrors it: same track and pattern indices.
+    project: Project,
+    /// Per project track: its sample is decoded and playing.
+    loaded: Vec<bool>,
     playing: bool,
     current_step: Option<usize>,
-    bpm: f32,
     cursor: Option<(f32, f32)>,
     pointer_cursor: bool,
-    selected_track: usize,
-    tracks: Vec<TrackState>,
+    /// Row of the selected track in the current pattern.
+    selected_row: usize,
     file_hover: bool,
     project_path: Option<PathBuf>,
     dirty: bool,
@@ -131,21 +121,16 @@ struct App {
 impl App {
     fn new(audio: Audio) -> Self {
         let (loads_tx, loads_rx) = channel();
-        Self {
+        let mut app = Self {
             audio,
             gpu: None,
-            pattern: default_pattern(),
+            project: Project::new(),
+            loaded: Vec::new(),
             playing: false,
             current_step: None,
-            bpm: DEFAULT_BPM,
             cursor: None,
             pointer_cursor: false,
-            selected_track: 0,
-            tracks: DEFAULT_TRACKS
-                .iter()
-                .enumerate()
-                .map(|(i, &kind)| TrackState { kind, sample_loaded: false, sample_path: None, color: i as u8 })
-                .collect(),
+            selected_row: 0,
             file_hover: false,
             project_path: None,
             dirty: false,
@@ -161,13 +146,33 @@ impl App {
             loads_rx,
             start: Instant::now(),
             error: None,
-        }
+        };
+        app.apply_project(Project::demo());
+        app
     }
 
     fn send(&mut self, cmd: Command) {
         if self.audio.handle.send(cmd).is_err() {
             eprintln!("engine queue is full, command dropped");
         }
+    }
+
+    fn pattern(&self) -> usize {
+        self.project.selected_pattern
+    }
+
+    /// Project tracks shown in the current pattern, top to bottom.
+    fn rows(&self) -> Vec<usize> {
+        self.project.rows(self.pattern())
+    }
+
+    /// Project track shown in `row`, if there is one.
+    fn track_at(&self, row: usize) -> Option<usize> {
+        self.rows().get(row).copied()
+    }
+
+    fn kind(&self, track: usize) -> DrumKind {
+        export::drum_kind(&self.project.tracks[track].instrument)
     }
 
     fn title(&self) -> String {
@@ -177,7 +182,7 @@ impl App {
             .and_then(|p| p.file_stem())
             .map_or_else(|| "Untitled".to_owned(), |n| n.to_string_lossy().into_owned());
         let mark = if self.dirty { " *" } else { "" };
-        format!("Refraktal – {name}{mark} – {:.0} BPM", self.bpm)
+        format!("Refraktal – {name}{mark} – {:.0} BPM", self.project.bpm)
     }
 
     fn update_title(&self) {
@@ -203,16 +208,14 @@ impl App {
         Some((message.clone(), alpha))
     }
 
-    fn track_labels(&self) -> Vec<String> {
-        self.tracks
-            .iter()
-            .map(|t| match &t.sample_path {
-                Some(path) => path
-                    .file_stem()
-                    .map_or_else(|| t.kind.name().to_owned(), |n| n.to_string_lossy().into_owned()),
-                None => t.kind.name().to_owned(),
-            })
-            .collect()
+    fn track_label(&self, track: usize) -> String {
+        let data = &self.project.tracks[track];
+        match (&data.sample, self.loaded[track]) {
+            (Some(path), true) => path
+                .file_stem()
+                .map_or_else(|| data.instrument.name().to_owned(), |n| n.to_string_lossy().into_owned()),
+            _ => data.instrument.name().to_owned(),
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -234,8 +237,8 @@ impl App {
     }
 
     fn change_bpm(&mut self, delta: f32) {
-        self.bpm = (self.bpm + delta).clamp(MIN_BPM, MAX_BPM);
-        self.send(Command::SetBpm(self.bpm));
+        self.project.bpm = (self.project.bpm + delta).clamp(MIN_BPM, MAX_BPM);
+        self.send(Command::SetBpm(self.project.bpm));
         self.dirty = true;
         self.update_title();
     }
@@ -258,21 +261,25 @@ impl App {
             Hit::TempoDown => self.change_bpm(-BPM_STEP),
             Hit::TempoUp => self.change_bpm(BPM_STEP),
             Hit::Help => self.help_visible = true,
-            Hit::Track(track) => {
+            Hit::Track(row) => {
+                let Some(track) = self.track_at(row) else { return };
                 // A second click on the selected track cycles its built-in sound.
-                if track == self.selected_track && !self.tracks[track].sample_loaded {
-                    let kind = self.tracks[track].kind.next();
-                    self.tracks[track].kind = kind;
+                if row == self.selected_row && !self.loaded[track] {
+                    let kind = self.kind(track).next();
+                    self.project.tracks[track].instrument = Instrument::drum(kind.name());
                     self.send(Command::SetDrum { track, kind });
                     self.mark_dirty();
                 }
-                self.selected_track = track;
+                self.selected_row = row;
                 self.send(Command::Trigger(track));
             }
-            Hit::Step { track, step } => {
-                self.pattern[track][step] = !self.pattern[track][step];
-                self.send(Command::ToggleStep { track, step });
-                self.mark_dirty();
+            Hit::Step { track: row, step } => {
+                let Some(track) = self.track_at(row) else { return };
+                let pattern = self.pattern();
+                if self.project.toggle_step(pattern, track, step).is_some() {
+                    self.send(Command::ToggleStep { pattern, track, step });
+                    self.mark_dirty();
+                }
             }
             Hit::None => {}
         }
@@ -284,19 +291,19 @@ impl App {
         if self.help_visible {
             return;
         }
-        if let Hit::Track(track) = self.hover() {
-            if self.tracks[track].sample_loaded {
-                self.tracks[track].sample_loaded = false;
-                self.tracks[track].sample_path = None;
-                self.send(Command::SetSample { track, sample: None });
-                self.mark_dirty();
-                self.notify("Back to the built-in sound");
-            } else if self.tracks.len() > 1 {
-                let name = self.tracks[track].kind.name();
-                self.selected_track = track;
-                self.remove_selected_track();
-                self.notify(format!("Removed {name}"));
-            }
+        let Hit::Track(row) = self.hover() else { return };
+        let Some(track) = self.track_at(row) else { return };
+        if self.loaded[track] {
+            self.loaded[track] = false;
+            self.project.tracks[track].sample = None;
+            self.send(Command::SetSample { track, sample: None });
+            self.mark_dirty();
+            self.notify("Back to the built-in sound");
+        } else if self.rows().len() > 1 {
+            let name = self.project.tracks[track].instrument.name().to_owned();
+            self.selected_row = row;
+            self.remove_selected_track();
+            self.notify(format!("Removed {name}"));
         }
     }
 
@@ -347,7 +354,7 @@ impl App {
     /// Write the project to the autosave file, if this platform uses one.
     fn save_autosave(&mut self) {
         if let Some(path) = &self.autosave {
-            match self.to_project().save(path) {
+            match self.project.save(path) {
                 Ok(()) => self.dirty = false,
                 Err(err) => eprintln!("Could not save the beat: {err:#}"),
             }
@@ -355,85 +362,75 @@ impl App {
     }
 
     fn add_track(&mut self) {
-        if self.tracks.len() >= MAX_TRACKS {
+        let pattern = self.pattern();
+        if !self.project.can_add_track(pattern) {
             return;
         }
         // Prefer a sound and a color that no track uses yet.
         let kind = DrumKind::ALL
             .into_iter()
-            .find(|k| self.tracks.iter().all(|t| t.kind != *k))
+            .find(|k| (0..self.project.tracks.len()).all(|t| self.kind(t) != *k))
             .unwrap_or(DrumKind::Kick);
-        let color = (0..MAX_TRACKS as u8)
-            .find(|c| self.tracks.iter().all(|t| t.color != *c))
+        let rows = self.rows();
+        let color = (0..MAX_ROWS as u8)
+            .find(|c| rows.iter().all(|&t| self.project.tracks[t].color != *c))
             .unwrap_or(0);
-        let index = self.tracks.len();
-        self.tracks.push(TrackState { kind, sample_loaded: false, sample_path: None, color });
-        self.pattern[index] = [false; STEPS];
+        let Some(track) = self.project.add_track(pattern, TrackData::new(Instrument::drum(kind.name()), color))
+        else {
+            return;
+        };
+        self.loaded.push(false);
         self.send(Command::AddTrack(kind));
-        self.send(Command::Trigger(index));
-        self.selected_track = index;
+        self.send(Command::Trigger(track));
+        self.selected_row = self.rows().iter().position(|&t| t == track).unwrap_or(0);
         self.mark_dirty();
         self.relayout();
     }
 
     fn remove_selected_track(&mut self) {
-        let index = self.selected_track;
-        if self.tracks.len() <= 1 || index >= self.tracks.len() {
+        let pattern = self.pattern();
+        let Some(track) = self.track_at(self.selected_row) else { return };
+        if self.rows().len() <= 1 {
             return;
         }
-        let count = self.tracks.len();
-        self.tracks.remove(index);
-        self.pattern[index..count].rotate_left(1);
-        self.pattern[count - 1] = [false; STEPS];
-        self.send(Command::RemoveTrack(index));
-        self.selected_track = index.min(self.tracks.len() - 1);
+        if self.project.remove_row(pattern, track) {
+            self.loaded.remove(track);
+            self.send(Command::RemoveTrack(track));
+            // Indices moved; results of samples still loading would land on the wrong track.
+            self.generation += 1;
+        } else {
+            // Still used by another pattern: only clear it here.
+            self.send(Command::SetRow { pattern, track, steps: [false; STEPS] });
+        }
+        self.selected_row = self.selected_row.min(self.rows().len().saturating_sub(1));
         self.mark_dirty();
         self.relayout();
     }
 
-    fn to_project(&self) -> Project {
-        Project {
-            bpm: self.bpm,
-            tracks: self
-                .tracks
-                .iter()
-                .zip(self.pattern.iter())
-                .map(|(t, steps)| TrackData {
-                    sound: t.kind.name().to_owned(),
-                    color: t.color,
-                    steps: *steps,
-                    sample: t.sample_path.clone(),
-                })
-                .collect(),
-        }
-    }
-
     /// Replace everything with `project`. Samples load in the background.
-    fn apply_project(&mut self, project: &Project) {
+    fn apply_project(&mut self, mut project: Project) {
         self.generation += 1;
         self.send(Command::Stop);
         self.playing = false;
         self.current_step = None;
 
-        self.pattern = [[false; STEPS]; MAX_TRACKS];
-        self.tracks.clear();
-        for (index, data) in project.tracks.iter().take(MAX_TRACKS).enumerate() {
-            let kind = export::drum_kind(&data.sound);
-            self.tracks.push(TrackState { kind, sample_loaded: false, sample_path: None, color: data.color });
-            self.pattern[index] = data.steps;
-        }
-        self.bpm = export::project_bpm(project);
+        project.bpm = export::project_bpm(&project);
         // The same commands the exporter uses, so export matches playback.
-        for cmd in export::project_commands(project) {
+        for cmd in export::project_commands(&project) {
             self.send(cmd);
         }
-
-        for (index, data) in project.tracks.iter().enumerate() {
-            if let Some(path) = &data.sample {
-                self.load_sample_into(index, path.clone());
-            }
+        self.loaded = vec![false; project.tracks.len()];
+        let samples: Vec<(usize, PathBuf)> = project
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.sample.clone().map(|path| (i, path)))
+            .collect();
+        self.project = project;
+        for (track, path) in samples {
+            self.load_sample_into(track, path);
         }
-        self.selected_track = 0;
+        self.selected_row = 0;
         self.relayout();
     }
 
@@ -441,21 +438,7 @@ impl App {
         if !self.confirm_discard() {
             return;
         }
-        let pattern = default_pattern();
-        let project = Project {
-            bpm: DEFAULT_BPM,
-            tracks: DEFAULT_TRACKS
-                .iter()
-                .enumerate()
-                .map(|(i, kind)| TrackData {
-                    sound: kind.name().to_owned(),
-                    color: i as u8,
-                    steps: pattern[i],
-                    sample: None,
-                })
-                .collect(),
-        };
-        self.apply_project(&project);
+        self.apply_project(Project::demo());
         self.project_path = None;
         self.dirty = false;
         self.update_title();
@@ -474,7 +457,7 @@ impl App {
     fn open_path(&mut self, path: &std::path::Path) {
         match Project::load(path) {
             Ok(project) => {
-                self.apply_project(&project);
+                self.apply_project(project);
                 self.project_path = Some(path.to_path_buf());
                 self.dirty = false;
                 self.update_title();
@@ -488,14 +471,12 @@ impl App {
     fn save_project(&mut self, save_as: bool) -> bool {
         let path = match (&self.project_path, save_as) {
             (Some(path), false) => path.clone(),
-            _ => {
-                match dialogs::pick_project_to_save() {
-                    Some(path) => path.with_extension(PROJECT_EXTENSION),
-                    None => return false,
-                }
-            }
+            _ => match dialogs::pick_project_to_save() {
+                Some(path) => path.with_extension(PROJECT_EXTENSION),
+                None => return false,
+            },
         };
-        match self.to_project().save(&path) {
+        match self.project.save(&path) {
             Ok(()) => {
                 self.notify(format!("Saved {}", file_name(&path)));
                 self.project_path = Some(path);
@@ -524,7 +505,7 @@ impl App {
     }
 
     fn relayout(&mut self) {
-        let count = self.tracks.len();
+        let count = self.rows().len();
         if let Some(gpu) = &mut self.gpu {
             gpu.track_count = count;
             let size = gpu.window.inner_size();
@@ -542,7 +523,9 @@ impl App {
             }
             return;
         }
-        self.load_sample_into(self.selected_track, path);
+        if let Some(track) = self.track_at(self.selected_row) {
+            self.load_sample_into(track, path);
+        }
     }
 
     fn load_sample_into(&mut self, track: usize, path: PathBuf) {
@@ -556,27 +539,25 @@ impl App {
 
     fn finish_loads(&mut self) {
         while let Ok(result) = self.loads_rx.try_recv() {
-            let name = result.path.file_name().map_or_else(
-                || result.path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            if result.generation != self.generation || result.track >= self.tracks.len() {
-                continue; // another project was opened, or the track was removed
+            let name = file_name(&result.path);
+            if result.generation != self.generation || result.track >= self.project.tracks.len() {
+                continue; // another project was opened, or tracks were removed
             }
             match result.sample {
                 Ok(sample) => {
-                    let track = &mut self.tracks[result.track];
-                    let changed = track.sample_path.as_deref() != Some(result.path.as_path());
-                    track.sample_loaded = true;
-                    track.sample_path = Some(result.path.clone());
-                    self.send(Command::SetSample {
-                        track: result.track,
-                        sample: Some(Arc::new(sample)),
-                    });
+                    let track = &mut self.project.tracks[result.track];
+                    let changed = track.sample.as_deref() != Some(result.path.as_path());
+                    track.sample = Some(result.path.clone());
+                    self.loaded[result.track] = true;
+                    self.send(Command::SetSample { track: result.track, sample: Some(Arc::new(sample)) });
                     if changed {
                         self.mark_dirty();
                     }
-                    self.notify(format!("Loaded {name} on track {}", result.track + 1));
+                    let row = self.rows().iter().position(|&t| t == result.track);
+                    self.notify(match row {
+                        Some(row) => format!("Loaded {name} on track {}", row + 1),
+                        None => format!("Loaded {name}"),
+                    });
                 }
                 Err(err) => {
                     eprintln!("Could not load {name}: {err:#}");
@@ -601,27 +582,34 @@ impl App {
         self.finish_loads();
         // Free samples the engine has replaced; never done on the audio thread.
         self.audio.handle.collect_garbage();
-        while let Some(Event::Step(step)) = self.audio.handle.poll_event() {
-            if self.playing {
-                self.current_step = Some(step);
+        while let Some(event) = self.audio.handle.poll_event() {
+            match event {
+                Event::Step(step) if self.playing => self.current_step = Some(step),
+                _ => {}
             }
         }
 
+        let rows = self.rows();
+        let pattern = self.pattern();
+        let mut grid = [[false; STEPS]; MAX_ROWS];
+        for (row, &track) in rows.iter().enumerate().take(MAX_ROWS) {
+            grid[row] = self.project.steps(pattern, track).copied().unwrap_or_default();
+        }
         let frame_state = FrameState {
             // Wrap time so the shaders keep float precision in long sessions.
             time: self.start.elapsed().as_secs_f32() % 3600.0,
             playing: self.playing,
             current_step: self.current_step,
-            pattern: self.pattern,
+            pattern: grid,
             hover: if self.help_visible { Hit::None } else { self.hover() },
-            bpm: self.bpm,
-            track_labels: self.track_labels(),
+            bpm: self.project.bpm,
+            track_labels: rows.iter().map(|&t| self.track_label(t)).collect(),
             help_visible: self.help_visible,
             status: self.status_for_frame(),
-            track_count: self.tracks.len(),
-            colors: std::array::from_fn(|i| self.tracks.get(i).map_or(0, |t| t.color)),
-            selected_track: self.selected_track,
-            sample_loaded: std::array::from_fn(|i| self.tracks.get(i).is_some_and(|t| t.sample_loaded)),
+            track_count: rows.len(),
+            colors: std::array::from_fn(|i| rows.get(i).map_or(0, |&t| self.project.tracks[t].color)),
+            selected_track: self.selected_row,
+            sample_loaded: std::array::from_fn(|i| rows.get(i).is_some_and(|&t| self.loaded[t])),
             file_hover: self.file_hover,
             touch: self.touch,
             autosave: self.autosave.is_some(),
@@ -637,7 +625,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match Gpu::new(event_loop, &self.title(), self.tracks.len()) {
+        match Gpu::new(event_loop, &self.title(), self.rows().len()) {
             Ok(gpu) => self.gpu = Some(gpu),
             Err(err) => {
                 self.error = Some(err);
@@ -718,9 +706,11 @@ impl ApplicationHandler for App {
                     KeyCode::Delete | KeyCode::Backspace => self.remove_selected_track(),
                     KeyCode::Equal | KeyCode::NumpadAdd => self.add_track(),
                     _ => {
-                        if let Some(track) = digit(code).filter(|&n| (1..=self.tracks.len()).contains(&n)) {
-                            self.selected_track = track - 1;
-                            self.send(Command::Trigger(track - 1));
+                        if let Some(row) = digit(code).map(|n| n - 1) {
+                            if let Some(track) = self.track_at(row) {
+                                self.selected_row = row;
+                                self.send(Command::Trigger(track));
+                            }
                         }
                     }
                 }

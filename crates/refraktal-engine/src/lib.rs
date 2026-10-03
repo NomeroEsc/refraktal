@@ -8,6 +8,10 @@
 //! * [`EngineHandle`] lives on the UI/control thread and talks to the engine
 //!   through lock-free ring buffers.
 //!
+//! The engine knows nothing about files or the editing model: it holds
+//! [`MAX_TRACKS`] preallocated track slots and [`MAX_PATTERNS`] step grids,
+//! and plays the selected pattern in a loop.
+//!
 //! Samples are shared as `Arc<Sample>`. When the engine replaces a sample it
 //! hands the old one back through a queue, so the memory is always freed on
 //! the control thread (see [`EngineHandle::collect_garbage`]).
@@ -21,12 +25,13 @@ use rtrb::{Consumer, Producer, RingBuffer};
 pub const STEPS: usize = 16;
 /// Most tracks a project can have. Slots are preallocated so adding a
 /// track never allocates on the audio thread.
-pub const MAX_TRACKS: usize = 8;
-/// Tracks in a new project.
-pub const DEFAULT_TRACKS: [DrumKind; 3] = [DrumKind::Kick, DrumKind::Snare, DrumKind::Hat];
+pub const MAX_TRACKS: usize = 32;
+/// Most patterns a project can have, also preallocated.
+pub const MAX_PATTERNS: usize = 16;
 
-// Large enough to load a whole project (8 tracks × 16 steps) in one go.
-const QUEUE_CAPACITY: usize = 1024;
+// Large enough to load a whole project in one go: one `SetRow` per track
+// and pattern (32 × 16) plus the tracks themselves.
+const QUEUE_CAPACITY: usize = 2048;
 const RETIRE_CAPACITY: usize = 64;
 const MIN_BPM: f32 = 20.0;
 const MAX_BPM: f32 = 999.0;
@@ -34,9 +39,11 @@ const SAMPLE_GAIN: f32 = 0.8;
 /// Fade applied to a sample that is cut off by the next hit.
 const RETRIGGER_FADE_SECONDS: f32 = 0.003;
 
-/// A pattern: one row of steps per track slot. Rows past the track count
+/// Steps of one track in one pattern.
+pub type Steps = [bool; STEPS];
+/// One pattern: a row of steps per track slot. Rows past the track count
 /// are always empty.
-pub type Pattern = [[bool; STEPS]; MAX_TRACKS];
+type Grid = [Steps; MAX_TRACKS];
 
 /// Built-in drum sounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,14 +98,21 @@ pub enum Command {
     Play,
     Stop,
     SetBpm(f32),
-    ToggleStep { track: usize, step: usize },
-    SetStep { track: usize, step: usize, on: bool },
-    /// Start over with a single empty track, e.g. before loading a project.
-    Reset(DrumKind),
-    /// Add a track at the end, if there is room.
+    ToggleStep { pattern: usize, track: usize, step: usize },
+    SetStep { pattern: usize, track: usize, step: usize, on: bool },
+    /// Replace all steps of one track in one pattern (used to load projects).
+    SetRow { pattern: usize, track: usize, steps: Steps },
+    /// Start over with no tracks and empty patterns, e.g. before loading a project.
+    Reset,
+    /// Add a track at the end, if there is room. It starts with no steps.
     AddTrack(DrumKind),
-    /// Remove a track; the ones below move up. The last track cannot be removed.
+    /// Remove a track from every pattern; the ones below move up.
     RemoveTrack(usize),
+    /// Play this pattern. While playing, the switch waits for the end of
+    /// the current bar so the beat never stumbles.
+    SelectPattern(usize),
+    /// Delete a pattern's steps; later patterns move up by one.
+    RemovePattern(usize),
     /// Change a track's built-in sound.
     SetDrum { track: usize, kind: DrumKind },
     /// Play a track once right now (to audition a sound).
@@ -113,21 +127,8 @@ pub enum Command {
 pub enum Event {
     /// The sequencer just played this step.
     Step(usize),
-}
-
-/// A simple four-on-the-floor starting beat.
-#[must_use]
-pub fn default_pattern() -> Pattern {
-    let mut p = [[false; STEPS]; MAX_TRACKS];
-    for step in (0..STEPS).step_by(4) {
-        p[0][step] = true; // kick on every beat
-    }
-    p[1][4] = true; // snare on 2 and 4
-    p[1][12] = true;
-    for step in (0..STEPS).step_by(2) {
-        p[2][step] = true; // 8th-note hats
-    }
-    p
+    /// This pattern is now playing (after `SelectPattern` took effect).
+    Pattern(usize),
 }
 
 /// Built-in synth voice of a track.
@@ -214,7 +215,10 @@ pub struct Engine {
     sample_rate: f32,
     bpm: f32,
     playing: bool,
-    pattern: Pattern,
+    patterns: Box<[Grid; MAX_PATTERNS]>,
+    pattern: usize,
+    /// Pattern to switch to at the start of the next bar.
+    next_pattern: Option<usize>,
     step: usize,
     samples_until_step: f64,
     tracks: [Track; MAX_TRACKS],
@@ -243,13 +247,13 @@ impl Engine {
             sample_rate,
             bpm: 120.0,
             playing: false,
-            pattern: default_pattern(),
+            patterns: Box::new([[[false; STEPS]; MAX_TRACKS]; MAX_PATTERNS]),
+            pattern: 0,
+            next_pattern: None,
             step: 0,
             samples_until_step: 0.0,
-            tracks: std::array::from_fn(|i| {
-                Track::new(DEFAULT_TRACKS.get(i).copied().unwrap_or(DrumKind::Kick), sample_rate)
-            }),
-            track_count: DEFAULT_TRACKS.len(),
+            tracks: std::array::from_fn(|_| Track::new(DrumKind::Kick, sample_rate)),
+            track_count: 0,
             gain: 0.8,
             commands: cmd_rx,
             events: evt_tx,
@@ -320,6 +324,7 @@ impl Engine {
                     self.playing = true;
                     self.step = 0;
                     self.samples_until_step = 0.0;
+                    self.switch_pattern();
                 }
             }
             Command::Stop => self.playing = false,
@@ -328,28 +333,34 @@ impl Engine {
                     self.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                 }
             }
-            Command::ToggleStep { track, step } => {
+            Command::ToggleStep { pattern, track, step } => {
+                if let Some(cell) = self.cell(pattern, track, step) {
+                    *cell = !*cell;
+                }
+            }
+            Command::SetStep { pattern, track, step, on } => {
+                if let Some(cell) = self.cell(pattern, track, step) {
+                    *cell = on;
+                }
+            }
+            Command::SetRow { pattern, track, steps } => {
                 if track < self.track_count {
-                    if let Some(cell) = self.pattern[track].get_mut(step) {
-                        *cell = !*cell;
+                    if let Some(grid) = self.patterns.get_mut(pattern) {
+                        grid[track] = steps;
                     }
                 }
             }
-            Command::SetStep { track, step, on } => {
-                if track < self.track_count {
-                    if let Some(cell) = self.pattern[track].get_mut(step) {
-                        *cell = on;
-                    }
-                }
-            }
-            Command::Reset(kind) => {
+            Command::Reset => {
                 for track in &mut self.tracks {
                     let old = track.sample.take();
                     retire(&mut self.retired, old);
                 }
-                self.tracks[0] = Track::new(kind, self.sample_rate);
-                self.track_count = 1;
-                self.pattern = [[false; STEPS]; MAX_TRACKS];
+                self.track_count = 0;
+                for grid in self.patterns.iter_mut() {
+                    *grid = [[false; STEPS]; MAX_TRACKS];
+                }
+                self.pattern = 0;
+                self.next_pattern = None;
             }
             Command::SetSample { track, sample } => {
                 if track < self.track_count {
@@ -369,19 +380,40 @@ impl Engine {
                     let old = self.tracks[index].sample.take();
                     retire(&mut self.retired, old);
                     self.tracks[index] = Track::new(kind, self.sample_rate);
-                    self.pattern[index] = [false; STEPS];
+                    for grid in self.patterns.iter_mut() {
+                        grid[index] = [false; STEPS];
+                    }
                     self.track_count += 1;
                 }
             }
             Command::RemoveTrack(track) => {
-                if track < self.track_count && self.track_count > 1 {
+                if track < self.track_count {
                     let old = self.tracks[track].sample.take();
                     retire(&mut self.retired, old);
                     // Move the removed slot to the end; nothing is allocated or freed.
-                    self.tracks[track..self.track_count].rotate_left(1);
-                    self.pattern[track..self.track_count].rotate_left(1);
+                    let count = self.track_count;
+                    self.tracks[track..count].rotate_left(1);
+                    for grid in self.patterns.iter_mut() {
+                        grid[track..count].rotate_left(1);
+                        grid[count - 1] = [false; STEPS];
+                    }
                     self.track_count -= 1;
-                    self.pattern[self.track_count] = [false; STEPS];
+                }
+            }
+            Command::SelectPattern(pattern) => {
+                if pattern < MAX_PATTERNS {
+                    self.next_pattern = Some(pattern);
+                    if !self.playing {
+                        self.switch_pattern();
+                    }
+                }
+            }
+            Command::RemovePattern(pattern) => {
+                if pattern < MAX_PATTERNS {
+                    self.patterns[pattern..].rotate_left(1);
+                    self.patterns[MAX_PATTERNS - 1] = [[false; STEPS]; MAX_TRACKS];
+                    self.pattern = after_removal(self.pattern, pattern);
+                    self.next_pattern = self.next_pattern.map(|p| after_removal(p, pattern));
                 }
             }
             Command::SetDrum { track, kind } => {
@@ -399,10 +431,31 @@ impl Engine {
         }
     }
 
+    fn cell(&mut self, pattern: usize, track: usize, step: usize) -> Option<&mut bool> {
+        if track >= self.track_count {
+            return None;
+        }
+        self.patterns.get_mut(pattern)?[track].get_mut(step)
+    }
+
+    /// Apply a pending `SelectPattern`.
+    fn switch_pattern(&mut self) {
+        if let Some(next) = self.next_pattern.take() {
+            if next != self.pattern {
+                self.pattern = next;
+                let _ = self.events.push(Event::Pattern(next));
+            }
+        }
+    }
+
     fn fire_step(&mut self) {
         let step = self.step;
+        if step == 0 {
+            self.switch_pattern();
+        }
+        let grid = &self.patterns[self.pattern];
         for (index, track) in self.tracks[..self.track_count].iter_mut().enumerate() {
-            if self.pattern[index][step] {
+            if grid[index][step] {
                 // Accent hats on the beat; everything else at full velocity.
                 let velocity = if track.kind == DrumKind::Hat && step % 4 != 0 { 0.6 } else { 1.0 };
                 track.trigger(velocity, self.sample_rate);
@@ -417,6 +470,11 @@ impl Engine {
         // 4 steps per beat.
         f64::from(self.sample_rate) * 60.0 / f64::from(self.bpm) / 4.0
     }
+}
+
+/// Index of pattern `p` after pattern `removed` was deleted.
+fn after_removal(p: usize, removed: usize) -> usize {
+    if p > removed { p - 1 } else { p }
 }
 
 /// Send a sample back to the control thread to be freed there.
@@ -459,10 +517,52 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+    /// Frames per step at 120 BPM and 48 kHz.
+    const STEP: usize = 6000;
+
+    fn row(on: &[usize]) -> Steps {
+        let mut steps = [false; STEPS];
+        for &i in on {
+            steps[i] = true;
+        }
+        steps
+    }
+
+    /// Kick, snare and hat with a four-on-the-floor beat in pattern 0.
+    fn demo(handle: &mut EngineHandle) {
+        for kind in [DrumKind::Kick, DrumKind::Snare, DrumKind::Hat] {
+            handle.send(Command::AddTrack(kind)).unwrap();
+        }
+        for (track, steps) in [row(&[0, 4, 8, 12]), row(&[4, 12]), row(&[0, 2, 4, 6, 8, 10, 12, 14])]
+            .into_iter()
+            .enumerate()
+        {
+            handle.send(Command::SetRow { pattern: 0, track, steps }).unwrap();
+        }
+    }
+
+    fn render(engine: &mut Engine, frames: usize) -> Vec<f32> {
+        let mut buf = vec![0.0; frames];
+        engine.process(&mut buf, 1);
+        buf
+    }
+
+    fn events(handle: &mut EngineHandle) -> Vec<Event> {
+        std::iter::from_fn(|| handle.poll_event()).collect()
+    }
+
+    #[test]
+    fn a_new_engine_is_empty_and_silent() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        assert_eq!(engine.track_count, 0);
+        handle.send(Command::Play).unwrap();
+        assert!(render(&mut engine, 4096).iter().all(|&s| s == 0.0));
+    }
 
     #[test]
     fn silent_until_play() {
-        let (mut engine, _handle) = Engine::new(SR);
+        let (mut engine, mut handle) = Engine::new(SR);
+        demo(&mut handle);
         let mut buf = vec![0.0; 4096];
         engine.process(&mut buf, 2);
         assert!(buf.iter().all(|&s| s == 0.0));
@@ -471,27 +571,37 @@ mod tests {
     #[test]
     fn play_advances_steps_and_makes_sound() {
         let (mut engine, mut handle) = Engine::new(SR);
+        demo(&mut handle);
         handle.send(Command::Play).unwrap();
-
-        // At 120 BPM a step is 6000 samples; render a bit more than two steps.
-        let mut buf = vec![0.0; 13_000];
-        engine.process(&mut buf, 1);
-
+        // A bit more than two steps.
+        let buf = render(&mut engine, 2 * STEP + 1000);
         assert!(buf.iter().any(|&s| s.abs() > 0.01), "no audio while playing");
-        assert_eq!(handle.poll_event(), Some(Event::Step(0)));
-        assert_eq!(handle.poll_event(), Some(Event::Step(1)));
-        assert_eq!(handle.poll_event(), Some(Event::Step(2)));
-        assert_eq!(handle.poll_event(), None);
+        assert_eq!(events(&mut handle), [Event::Step(0), Event::Step(1), Event::Step(2)]);
     }
 
     #[test]
     fn invalid_commands_are_ignored() {
         let (mut engine, mut handle) = Engine::new(SR);
-        handle.send(Command::ToggleStep { track: 99, step: 99 }).unwrap();
-        handle.send(Command::SetBpm(f32::NAN)).unwrap();
-        let mut buf = vec![0.0; 64];
-        engine.process(&mut buf, 2);
-        assert_eq!(engine.pattern, default_pattern());
+        demo(&mut handle);
+        engine.process(&mut [], 1);
+        let before = engine.patterns.clone();
+        for cmd in [
+            Command::ToggleStep { pattern: 0, track: 99, step: 0 },
+            Command::ToggleStep { pattern: 0, track: 0, step: 99 },
+            Command::ToggleStep { pattern: 99, track: 0, step: 0 },
+            Command::ToggleStep { pattern: 0, track: 5, step: 0 }, // slot exists, track does not
+            Command::SetRow { pattern: 0, track: 5, steps: [true; STEPS] },
+            Command::SetBpm(f32::NAN),
+            Command::SelectPattern(99),
+            Command::RemovePattern(99),
+            Command::RemoveTrack(99),
+        ] {
+            handle.send(cmd).unwrap();
+        }
+        engine.process(&mut [], 1);
+        assert_eq!(engine.patterns, before);
+        assert_eq!(engine.track_count, 3);
+        assert_eq!(engine.pattern, 0);
         assert!((engine.bpm - 120.0).abs() < f32::EPSILON);
     }
 
@@ -502,14 +612,8 @@ mod tests {
     #[test]
     fn loaded_sample_replaces_the_synth() {
         let (mut engine, mut handle) = Engine::new(SR);
-        // Only the kick track plays, on step 0.
-        for step in 0..STEPS {
-            for track in 0..MAX_TRACKS {
-                if engine.pattern[track][step] && !(track == 0 && step == 0) {
-                    handle.send(Command::ToggleStep { track, step }).unwrap();
-                }
-            }
-        }
+        handle.send(Command::AddTrack(DrumKind::Kick)).unwrap();
+        handle.send(Command::SetStep { pattern: 0, track: 0, step: 0, on: true }).unwrap();
         handle.send(Command::SetSample { track: 0, sample: Some(constant_sample(0.5, 1000)) }).unwrap();
         handle.send(Command::Play).unwrap();
 
@@ -523,52 +627,162 @@ mod tests {
     #[test]
     fn replaced_samples_come_back_to_be_freed() {
         let (mut engine, mut handle) = Engine::new(SR);
-        let mut buf = vec![0.0; 64];
+        demo(&mut handle);
         handle.send(Command::SetSample { track: 1, sample: Some(constant_sample(0.1, 10)) }).unwrap();
-        engine.process(&mut buf, 2);
+        engine.process(&mut [], 2);
         assert_eq!(handle.collect_garbage(), 0);
 
         handle.send(Command::SetSample { track: 1, sample: Some(constant_sample(0.2, 10)) }).unwrap();
         handle.send(Command::SetSample { track: 1, sample: None }).unwrap();
-        engine.process(&mut buf, 2);
+        engine.process(&mut [], 2);
         assert_eq!(handle.collect_garbage(), 2);
     }
 
     #[test]
     fn add_and_remove_tracks() {
         let (mut engine, mut handle) = Engine::new(SR);
-        let mut buf = vec![0.0; 64];
+        demo(&mut handle);
         handle.send(Command::AddTrack(DrumKind::Clap)).unwrap();
-        handle.send(Command::ToggleStep { track: 3, step: 5 }).unwrap();
-        engine.process(&mut buf, 2);
+        handle.send(Command::ToggleStep { pattern: 0, track: 3, step: 5 }).unwrap();
+        handle.send(Command::ToggleStep { pattern: 2, track: 3, step: 6 }).unwrap();
+        engine.process(&mut [], 2);
         assert_eq!(engine.track_count, 4);
-        assert!(engine.pattern[3][5]);
+        assert!(engine.patterns[0][3][5]);
         assert_eq!(engine.tracks[3].kind, DrumKind::Clap);
 
-        // Removing the snare moves hat and clap up one row.
+        // Removing the snare moves hat and clap up one row in every pattern.
         handle.send(Command::RemoveTrack(1)).unwrap();
-        engine.process(&mut buf, 2);
+        engine.process(&mut [], 2);
         assert_eq!(engine.track_count, 3);
         assert_eq!(engine.tracks[1].kind, DrumKind::Hat);
         assert_eq!(engine.tracks[2].kind, DrumKind::Clap);
-        assert!(engine.pattern[2][5]);
-        assert_eq!(engine.pattern[3], [false; STEPS]);
+        assert!(engine.patterns[0][2][5]);
+        assert!(engine.patterns[2][2][6]);
+        assert_eq!(engine.patterns[0][3], [false; STEPS]);
+        assert_eq!(engine.patterns[2][3], [false; STEPS]);
+    }
+
+    #[test]
+    fn a_reused_slot_starts_empty() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        handle.send(Command::AddTrack(DrumKind::Kick)).unwrap();
+        handle.send(Command::SetRow { pattern: 4, track: 0, steps: [true; STEPS] }).unwrap();
+        handle.send(Command::RemoveTrack(0)).unwrap();
+        handle.send(Command::AddTrack(DrumKind::Tom)).unwrap();
+        engine.process(&mut [], 2);
+        assert_eq!(engine.patterns[4][0], [false; STEPS]);
     }
 
     #[test]
     fn track_limits_are_respected() {
         let (mut engine, mut handle) = Engine::new(SR);
-        let mut buf = vec![0.0; 64];
-        for _ in 0..20 {
+        for _ in 0..MAX_TRACKS + 5 {
             handle.send(Command::AddTrack(DrumKind::Tom)).unwrap();
         }
-        engine.process(&mut buf, 2);
+        engine.process(&mut [], 2);
         assert_eq!(engine.track_count, MAX_TRACKS);
-        for _ in 0..20 {
+        for _ in 0..MAX_TRACKS + 5 {
             handle.send(Command::RemoveTrack(0)).unwrap();
         }
-        engine.process(&mut buf, 2);
+        engine.process(&mut [], 2);
+        assert_eq!(engine.track_count, 0);
+    }
+
+    #[test]
+    fn reset_then_rebuild() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        demo(&mut handle);
+        handle.send(Command::SetSample { track: 0, sample: Some(constant_sample(0.1, 10)) }).unwrap();
+        handle.send(Command::SetRow { pattern: 3, track: 2, steps: [true; STEPS] }).unwrap();
+        handle.send(Command::SelectPattern(3)).unwrap();
+        handle.send(Command::Reset).unwrap();
+        handle.send(Command::AddTrack(DrumKind::Tom)).unwrap();
+        handle.send(Command::SetStep { pattern: 0, track: 0, step: 3, on: true }).unwrap();
+        engine.process(&mut [], 2);
         assert_eq!(engine.track_count, 1);
+        assert_eq!(engine.tracks[0].kind, DrumKind::Tom);
+        assert_eq!(engine.pattern, 0);
+        assert_eq!(engine.patterns[0][0], row(&[3]));
+        assert_eq!(engine.patterns[3][2], [false; STEPS]);
+        assert_eq!(handle.collect_garbage(), 1);
+    }
+
+    #[test]
+    fn selecting_a_pattern_while_stopped_is_immediate() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        handle.send(Command::SelectPattern(2)).unwrap();
+        engine.process(&mut [], 1);
+        assert_eq!(engine.pattern, 2);
+        assert_eq!(events(&mut handle), [Event::Pattern(2)]);
+    }
+
+    #[test]
+    fn selecting_a_pattern_while_playing_waits_for_the_bar() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        handle.send(Command::AddTrack(DrumKind::Kick)).unwrap();
+        // Pattern 0: kick on step 0. Pattern 1: kick on step 8 only.
+        handle.send(Command::SetRow { pattern: 0, track: 0, steps: row(&[0]) }).unwrap();
+        handle.send(Command::SetRow { pattern: 1, track: 0, steps: row(&[8]) }).unwrap();
+        handle.send(Command::Play).unwrap();
+        render(&mut engine, 5 * STEP + 10);
+        events(&mut handle);
+
+        // Halfway through the bar: still pattern 0 until step 0 comes round.
+        handle.send(Command::SelectPattern(1)).unwrap();
+        render(&mut engine, 1);
+        assert_eq!(engine.pattern, 0, "switched in the middle of a bar");
+        // Up to the last frame before the next bar: steps 6 to 15 play.
+        let rest_of_bar = engine.frames_until_step().unwrap() + 10 * STEP;
+        render(&mut engine, rest_of_bar);
+        assert_eq!(engine.pattern, 0, "switched before the bar ended");
+        assert_eq!(engine.next_step(), 0);
+        events(&mut handle);
+
+        // The frame that starts the next bar switches, then plays step 0.
+        render(&mut engine, 1);
+        assert_eq!(events(&mut handle), [Event::Pattern(1), Event::Step(0)]);
+        assert_eq!(engine.pattern, 1);
+
+        // The new pattern really plays: nothing until its hit on step 8.
+        let bar = render(&mut engine, STEPS * STEP);
+        let hit = 8 * STEP - 1;
+        assert!(bar[..hit].iter().all(|&s| s == 0.0), "pattern 1 has nothing before step 8");
+        assert!(bar[hit..hit + 2000].iter().any(|s| s.abs() > 0.1), "pattern 1 step 8 did not play");
+    }
+
+    #[test]
+    fn removing_a_pattern_moves_the_later_ones_up() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        handle.send(Command::AddTrack(DrumKind::Kick)).unwrap();
+        for pattern in 0..4 {
+            handle.send(Command::SetRow { pattern, track: 0, steps: row(&[pattern]) }).unwrap();
+        }
+        handle.send(Command::SelectPattern(3)).unwrap();
+        handle.send(Command::RemovePattern(1)).unwrap();
+        engine.process(&mut [], 1);
+        assert_eq!(engine.patterns[0][0], row(&[0]));
+        assert_eq!(engine.patterns[1][0], row(&[2]));
+        assert_eq!(engine.patterns[2][0], row(&[3]));
+        assert_eq!(engine.patterns[3][0], [false; STEPS]);
+        assert_eq!(engine.pattern, 2, "the playing pattern keeps playing");
+    }
+
+    #[test]
+    fn a_whole_project_fits_in_the_queue() {
+        let (mut engine, mut handle) = Engine::new(SR);
+        handle.send(Command::Reset).unwrap();
+        for _ in 0..MAX_TRACKS {
+            handle.send(Command::AddTrack(DrumKind::Hat)).unwrap();
+        }
+        for pattern in 0..MAX_PATTERNS {
+            for track in 0..MAX_TRACKS {
+                handle.send(Command::SetRow { pattern, track, steps: [true; STEPS] }).unwrap();
+            }
+        }
+        handle.send(Command::SetBpm(130.0)).unwrap();
+        handle.send(Command::SelectPattern(0)).unwrap();
+        engine.process(&mut [], 1);
+        assert!(engine.patterns.iter().all(|g| g.iter().all(|r| *r == [true; STEPS])));
     }
 
     #[test]
@@ -590,21 +804,5 @@ mod tests {
                 assert_eq!(handle.poll_event(), Some(Event::Step(expected_step % STEPS)), "at {bpm} BPM");
             }
         }
-    }
-
-    #[test]
-    fn reset_then_rebuild() {
-        let (mut engine, mut handle) = Engine::new(SR);
-        let mut buf = vec![0.0; 64];
-        handle.send(Command::SetSample { track: 0, sample: Some(constant_sample(0.1, 10)) }).unwrap();
-        handle.send(Command::Reset(DrumKind::Tom)).unwrap();
-        handle.send(Command::AddTrack(DrumKind::Clap)).unwrap();
-        handle.send(Command::SetStep { track: 1, step: 3, on: true }).unwrap();
-        engine.process(&mut buf, 2);
-        assert_eq!(engine.track_count, 2);
-        assert_eq!(engine.tracks[0].kind, DrumKind::Tom);
-        assert!(engine.pattern[1][3]);
-        assert!(!engine.pattern[0][0]);
-        assert_eq!(handle.collect_garbage(), 1);
     }
 }

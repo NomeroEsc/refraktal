@@ -91,7 +91,15 @@ a WAV file (the pattern four times, then the tail of the last hits) and
 | `s`, `stop`        | stop                                |
 | `bpm 140`          | set tempo                           |
 | `t snare 8`        | toggle step 8 of the snare track    |
+| `add tom`          | add a track to the current pattern  |
+| `pat`              | list patterns                       |
+| `pat new`, `pat 2` | add a pattern, select pattern 2     |
+| `pat del 2`        | delete pattern 2                    |
+| `share own`        | new tracks join only their pattern (`share shared` to undo) |
+| `save beat.refraktal`, `open beat.refraktal` | save or open a project |
+| `export beat.wav`  | render the current pattern to WAV   |
 | `show`             | print the pattern                   |
+| `help`             | list every command                  |
 | `q`, `quit`        | exit                                |
 
 ## Project layout

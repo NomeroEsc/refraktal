@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result, anyhow};
-use refraktal_engine::{MAX_TRACKS, default_pattern};
-use refraktal_ui::{FrameState, Hit, Layout, Renderer};
+use refraktal_io::Project;
+use refraktal_ui::{FrameState, Hit, Layout, MAX_TRACKS, Renderer, STEPS};
 
 pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, touch: bool) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -35,7 +35,10 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
     let mut renderer = Renderer::new(&device, format, width, height);
     let track_count = 4;
     let layout = Layout::compute(width as f32, height as f32, scale, track_count);
-    let mut pattern = default_pattern();
+    let mut pattern = [[false; STEPS]; MAX_TRACKS];
+    for (row, steps) in Project::demo().patterns[0].steps.iter().flatten().enumerate() {
+        pattern[row] = *steps;
+    }
     for step in [3, 7, 11, 14] {
         pattern[3][step] = true;
     }
@@ -48,7 +51,7 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
         colors: [0, 1, 2, 4, 0, 0, 0, 0],
         hover: Hit::None,
         selected_track: 3,
-        sample_loaded: std::array::from_fn(|i| i == 0 && i < MAX_TRACKS),
+        sample_loaded: std::array::from_fn(|i| i == 0),
         file_hover: false,
         bpm: 124.0,
         track_labels: vec!["kick".into(), "snare".into(), "hat".into(), "clap".into()],
