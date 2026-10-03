@@ -2,14 +2,23 @@
 
 An open-source, pattern-based music studio written in pure Rust.
 
-> **Status:** alpha. A 16-step drum machine with a GPU-rendered glass
-> interface. Expect rough edges and file format changes.
+> **Status:** alpha. A 16-step drum machine with patterns, samples and WAV
+> export, behind a GPU-rendered glass interface. Expect rough edges and file
+> format changes.
 
 ## Download
 
 Prebuilt binaries for Windows, Linux and macOS are on the
 [Releases](../../releases) page. Each release lists SHA-256 checksums in
-`SHA256SUMS.txt`.
+`SHA256SUMS.txt`. To check a download, put it next to that file and run:
+
+```sh
+sha256sum -c SHA256SUMS.txt --ignore-missing      # Linux, macOS, Git Bash
+```
+
+```powershell
+Get-FileHash refraktal-*-windows-x64.zip -Algorithm SHA256   # PowerShell
+```
 
 The binaries are not code-signed yet:
 
@@ -26,9 +35,12 @@ The binaries are not code-signed yet:
 
 ## Android
 
-Refraktal runs on Android 8.0 or newer (arm64), in landscape. Tap to edit,
-hold a track's dot to remove it, and tap **?** for help. Your beat is saved
-automatically when you leave the app. The app requests no permissions.
+Refraktal runs on Android 8.0 or newer (arm64), in landscape. Tap a sound
+to add a track, tap cells to edit, tap a pattern number to switch patterns
+and hold it to delete one; hold a track's dot to remove the track. Tap **?**
+for help. Your beat is saved automatically when you leave the app. The app
+requests no permissions. Exporting to WAV on Android comes in a later
+version.
 
 The APK is built by GitHub Actions and attached to each release. It is
 distributed outside Google Play and without Google's developer
@@ -44,7 +56,7 @@ cargo apk build -p refraktal-android --lib --release
 
 ## Building
 
-You need a recent stable Rust toolchain (1.85 or newer).
+You need a recent stable Rust toolchain (1.87 or newer).
 
 ```sh
 cargo run
@@ -76,12 +88,15 @@ a console window, so use a debug build for `--cli` there.
 | `Ctrl+S` / `Ctrl+Shift+S` | save / save as         |
 | `Ctrl+O`, or drop a `.refraktal` file | open a project |
 | `Ctrl+N`              | new project               |
-
-Projects are small JSON files (`.refraktal`). Samples are referenced by
-path, relative to the project file when they live in the same folder, so
-keep samples next to the project if you want to move or share it.
 | drop an audio file    | play it on the selected track (WAV, FLAC, MP3, OGG) |
-| right-click a track dot | back to the built-in sound |
+| right-click a track dot | back to the built-in sound, or remove the track |
+| `F1` / click `?`      | help                      |
+
+Projects are small JSON files (`.refraktal`) holding the tracks, every
+pattern and the tempo. Samples are referenced by path, relative to the
+project file when they live in the same folder, so keep samples next to the
+project if you want to move or share it. Files from older versions open and
+are upgraded when saved.
 
 Run `cargo run -- --help` for options, e.g. `--screenshot shot.png` renders
 one frame to a file, `--export beat.refraktal beat.wav` renders a project to
@@ -111,9 +126,9 @@ a WAV file (the pattern four times, then the tail of the last hits) and
 
 | Crate              | Purpose                                         |
 |--------------------|-------------------------------------------------|
-| `refraktal-dsp`    | oscillators, filters, drum voices               |
-| `refraktal-engine` | real-time engine, sequencer, lock-free control  |
-| `refraktal-io`     | decoding audio files (later: saving projects)   |
+| `refraktal-dsp`    | drum voices, sample playback, filters, noise    |
+| `refraktal-engine` | real-time engine, patterns, lock-free control   |
+| `refraktal-io`     | project model and files, audio decoding, WAV writing |
 | `refraktal-android` | Android entry point and app manifest          |
 | `refraktal-ui`     | wgpu renderer: backdrop, blur, glass, controls  |
 | `refraktal`        | the application: audio, window, input; desktop entry point |
