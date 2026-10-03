@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.2
 
 - Export a project to WAV (48 kHz, 16-bit stereo) from the command line:
   `refraktal --export beat.refraktal beat.wav`. The pattern plays four times,
@@ -11,7 +11,7 @@
 - New screen: a row of patterns and a row of sounds above the sequencer.
   Pick a sound to add a track with it; each built-in sound has its own
   color. New projects start empty.
-- Export button (and Ctrl+E) on desktop.
+- Export button (and Ctrl+E) on desktop; on Android it arrives in the next update.
 - Up to 32 tracks per project, 8 per pattern.
 - Project files are now version 2 (instruments, patterns). Older files open
   and are upgraded when saved; older versions of Refraktal cannot open

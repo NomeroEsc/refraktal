@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "refraktal"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "assert_no_alloc",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "refraktal-android"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "refraktal",
  "winit",
@@ -1706,11 +1706,11 @@ dependencies = [
 
 [[package]]
 name = "refraktal-dsp"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "refraktal-engine"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "refraktal-dsp",
  "rtrb",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "refraktal-io"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "hound",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "refraktal-ui"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ab_glyph",
  "bytemuck",
