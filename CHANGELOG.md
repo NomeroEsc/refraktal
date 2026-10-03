@@ -7,9 +7,11 @@
   then the last hits ring out. Exports sound exactly like playback.
 - Patterns: up to 16 per project. Tracks can be shared by every pattern
   (the default) or belong to one pattern each; switching keeps the beat.
-  While playing, a newly selected pattern starts at the next bar. For now
-  patterns are managed from the text interface (`--cli`); the new screen
-  comes next.
+  While playing, a newly selected pattern starts at the next bar.
+- New screen: a row of patterns and a row of sounds above the sequencer.
+  Pick a sound to add a track with it; each built-in sound has its own
+  color. New projects start empty.
+- Export button (and Ctrl+E) on desktop.
 - Up to 32 tracks per project, 8 per pattern.
 - Project files are now version 2 (instruments, patterns). Older files open
   and are upgraded when saved; older versions of Refraktal cannot open

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use refraktal_dsp::Sample;
 use refraktal_engine::{Command, DrumKind, Event, STEPS};
-use refraktal_io::{Instrument, PROJECT_EXTENSION, Project, TrackData};
-use refraktal_ui::{FrameState, Hit, Layout, MAX_TRACKS as MAX_ROWS, Renderer};
+use refraktal_io::{Instrument, PROJECT_EXTENSION, Project, Sharing, TrackData};
+use refraktal_ui::{Chip, Content, FrameState, Hit, Layout, MAX_TRACKS as MAX_ROWS, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -29,13 +29,51 @@ const BPM_STEP: f32 = 5.0;
 const STATUS_TIME: Duration = Duration::from_millis(3000);
 const STATUS_FADE: Duration = Duration::from_millis(500);
 
-/// Result of decoding a dropped file on a loader thread.
+/// Where a decoded sample goes.
+#[derive(Clone, Copy)]
+enum LoadTarget {
+    /// Replace the sound of this project track.
+    Track(usize),
+    /// Add a new track to this pattern once the file has decoded, so a
+    /// file that fails to load leaves nothing behind.
+    NewTrack { pattern: usize },
+}
+
+/// Result of decoding a file on a loader thread.
 struct LoadResult {
     /// Project generation the load was started for; stale results are ignored.
     generation: u64,
-    track: usize,
+    target: LoadTarget,
     path: PathBuf,
     sample: anyhow::Result<Sample>,
+}
+
+/// Result of an export on a background thread.
+struct ExportResult {
+    path: PathBuf,
+    /// Length in seconds, or what went wrong.
+    result: anyhow::Result<f32>,
+}
+
+/// What a chip in the sound row adds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SoundChip {
+    Drum(DrumKind),
+    /// Pick an audio file and add a track that plays it (desktop only).
+    SampleFile,
+}
+
+fn sound_chips() -> Vec<SoundChip> {
+    let mut chips: Vec<SoundChip> = DrumKind::ALL.iter().map(|&k| SoundChip::Drum(k)).collect();
+    if dialogs::CAN_PICK_FILES {
+        chips.push(SoundChip::SampleFile);
+    }
+    chips
+}
+
+/// Each built-in sound has its own color, so a chip and the track it adds match.
+fn sound_color(kind: DrumKind) -> u8 {
+    DrumKind::ALL.iter().position(|&k| k == kind).unwrap_or(0) as u8
 }
 
 /// Platform differences the window needs to know about.
@@ -82,7 +120,7 @@ struct Gpu {
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     layout: Layout,
-    track_count: usize,
+    content: Content,
 }
 
 struct App {
@@ -99,6 +137,11 @@ struct App {
     pointer_cursor: bool,
     /// Row of the selected track in the current pattern.
     selected_row: usize,
+    /// Pattern the engine is playing (it waits for the bar to end before switching).
+    playing_pattern: usize,
+    exports_tx: Sender<ExportResult>,
+    exports_rx: Receiver<ExportResult>,
+    exporting: bool,
     file_hover: bool,
     project_path: Option<PathBuf>,
     dirty: bool,
@@ -121,6 +164,7 @@ struct App {
 impl App {
     fn new(audio: Audio) -> Self {
         let (loads_tx, loads_rx) = channel();
+        let (exports_tx, exports_rx) = channel();
         let mut app = Self {
             audio,
             gpu: None,
@@ -131,6 +175,10 @@ impl App {
             cursor: None,
             pointer_cursor: false,
             selected_row: 0,
+            playing_pattern: 0,
+            exports_tx,
+            exports_rx,
+            exporting: false,
             file_hover: false,
             project_path: None,
             dirty: false,
@@ -147,7 +195,7 @@ impl App {
             start: Instant::now(),
             error: None,
         };
-        app.apply_project(Project::demo());
+        app.apply_project(Project::new());
         app
     }
 
@@ -169,6 +217,15 @@ impl App {
     /// Project track shown in `row`, if there is one.
     fn track_at(&self, row: usize) -> Option<usize> {
         self.rows().get(row).copied()
+    }
+
+    /// What the screen has to fit.
+    fn content(&self) -> Content {
+        Content {
+            tracks: self.rows().len(),
+            patterns: self.project.patterns.len(),
+            sounds: sound_chips().len(),
+        }
     }
 
     fn kind(&self, track: usize) -> DrumKind {
@@ -257,10 +314,31 @@ impl App {
         }
         match self.hover() {
             Hit::Play => self.toggle_play(),
-            Hit::AddTrack => self.add_track(),
             Hit::TempoDown => self.change_bpm(-BPM_STEP),
             Hit::TempoUp => self.change_bpm(BPM_STEP),
             Hit::Help => self.help_visible = true,
+            Hit::Export => self.export(),
+            Hit::Chip(Chip::Pattern(pattern)) => self.select_pattern(pattern),
+            Hit::Chip(Chip::AddPattern) => match self.project.add_pattern() {
+                Some(pattern) => {
+                    self.select_pattern(pattern);
+                    self.mark_dirty();
+                }
+                None => self.notify("A project has at most 16 patterns"),
+            },
+            Hit::Chip(Chip::Sharing) => self.toggle_sharing(),
+            Hit::Chip(Chip::Sound(n)) => match sound_chips().get(n) {
+                Some(SoundChip::Drum(kind)) => self.add_track(*kind),
+                Some(SoundChip::SampleFile) => {
+                    if !self.project.can_add_track(self.pattern()) {
+                        self.notify(format!("A pattern holds at most {MAX_ROWS} tracks"));
+                    } else if let Some(path) = dialogs::pick_sample_to_open() {
+                        let pattern = self.pattern();
+                        self.load_sample(LoadTarget::NewTrack { pattern }, path);
+                    }
+                }
+                None => {}
+            },
             Hit::Track(row) => {
                 let Some(track) = self.track_at(row) else { return };
                 // A second click on the selected track cycles its built-in sound.
@@ -291,7 +369,11 @@ impl App {
         if self.help_visible {
             return;
         }
-        let Hit::Track(row) = self.hover() else { return };
+        let row = match self.hover() {
+            Hit::Track(row) => row,
+            Hit::Chip(Chip::Pattern(pattern)) => return self.delete_pattern(pattern),
+            _ => return,
+        };
         let Some(track) = self.track_at(row) else { return };
         if self.loaded[track] {
             self.loaded[track] = false;
@@ -299,7 +381,7 @@ impl App {
             self.send(Command::SetSample { track, sample: None });
             self.mark_dirty();
             self.notify("Back to the built-in sound");
-        } else if self.rows().len() > 1 {
+        } else {
             let name = self.project.tracks[track].instrument.name().to_owned();
             self.selected_row = row;
             self.remove_selected_track();
@@ -361,38 +443,119 @@ impl App {
         }
     }
 
-    fn add_track(&mut self) {
-        let pattern = self.pattern();
-        if !self.project.can_add_track(pattern) {
-            return;
+    /// Add a track with a built-in sound to the current pattern.
+    fn add_track(&mut self, kind: DrumKind) {
+        let data = TrackData::new(Instrument::drum(kind.name()), sound_color(kind));
+        if let Some(track) = self.push_track(data) {
+            self.send(Command::Trigger(track));
         }
-        // Prefer a sound and a color that no track uses yet.
-        let kind = DrumKind::ALL
-            .into_iter()
-            .find(|k| (0..self.project.tracks.len()).all(|t| self.kind(t) != *k))
-            .unwrap_or(DrumKind::Kick);
-        let rows = self.rows();
-        let color = (0..MAX_ROWS as u8)
-            .find(|c| rows.iter().all(|&t| self.project.tracks[t].color != *c))
-            .unwrap_or(0);
-        let Some(track) = self.project.add_track(pattern, TrackData::new(Instrument::drum(kind.name()), color))
-        else {
-            return;
+    }
+
+    /// Add a track to the current pattern and the engine; select it.
+    fn push_track(&mut self, data: TrackData) -> Option<usize> {
+        let pattern = self.pattern();
+        let kind = export::drum_kind(&data.instrument);
+        let Some(track) = self.project.add_track(pattern, data) else {
+            self.notify(format!("A pattern holds at most {MAX_ROWS} tracks"));
+            return None;
         };
         self.loaded.push(false);
         self.send(Command::AddTrack(kind));
-        self.send(Command::Trigger(track));
         self.selected_row = self.rows().iter().position(|&t| t == track).unwrap_or(0);
         self.mark_dirty();
         self.relayout();
+        Some(track)
+    }
+
+    fn select_pattern(&mut self, pattern: usize) {
+        if pattern >= self.project.patterns.len() {
+            return;
+        }
+        self.project.selected_pattern = pattern;
+        self.send(Command::SelectPattern(pattern));
+        self.selected_row = 0;
+        self.relayout();
+    }
+
+    fn delete_pattern(&mut self, pattern: usize) {
+        let name = self.project.patterns.get(pattern).map(|p| p.name.clone()).unwrap_or_default();
+        let Some(removed) = self.project.remove_pattern(pattern) else {
+            self.notify("The last pattern cannot be deleted");
+            return;
+        };
+        self.send(Command::RemovePattern(pattern));
+        for &track in &removed {
+            self.loaded.remove(track);
+            self.send(Command::RemoveTrack(track));
+        }
+        if !removed.is_empty() {
+            // Indices moved; results of samples still loading would land on the wrong track.
+            self.generation += 1;
+        }
+        let selected = self.pattern();
+        self.select_pattern(selected);
+        self.mark_dirty();
+        self.notify(format!("Deleted {name}"));
+    }
+
+    fn toggle_sharing(&mut self) {
+        let next = match self.project.sharing {
+            Sharing::Shared => Sharing::PerPattern,
+            Sharing::PerPattern => Sharing::Shared,
+        };
+        // Switching never changes what plays, so the engine needs no update.
+        match self.project.set_sharing(next) {
+            Ok(()) => {
+                self.selected_row = 0;
+                self.mark_dirty();
+                self.relayout();
+                self.notify(match next {
+                    Sharing::Shared => "Tracks are shared by every pattern",
+                    Sharing::PerPattern => "New tracks join only their own pattern",
+                });
+            }
+            Err(err) => self.notify(format!("Cannot share tracks: {err}")),
+        }
+    }
+
+    /// Render the selected pattern to a WAV file on a background thread.
+    fn export(&mut self) {
+        if self.exporting {
+            return;
+        }
+        if !dialogs::CAN_PICK_FILES {
+            self.notify("Export on Android comes with the next update");
+            return;
+        }
+        let Some(path) = dialogs::pick_wav_to_save() else { return };
+        let path = path.with_extension("wav");
+        let project = self.project.clone();
+        let tx = self.exports_tx.clone();
+        self.exporting = true;
+        self.notify("Exporting…");
+        std::thread::spawn(move || {
+            let result = export::load_samples(&project).and_then(|samples| {
+                let rendered = export::render(&project, &samples);
+                refraktal_io::save_wav(&path, &rendered.audio, export::EXPORT_SAMPLE_RATE)?;
+                Ok(rendered.seconds())
+            });
+            let _ = tx.send(ExportResult { path, result });
+        });
+    }
+
+    fn finish_exports(&mut self) {
+        while let Ok(done) = self.exports_rx.try_recv() {
+            self.exporting = false;
+            match done.result {
+                Ok(seconds) => self.notify(format!("Exported {} ({seconds:.1} s)", file_name(&done.path))),
+                Err(err) => dialogs::show_error("Could not export", &err),
+            }
+        }
     }
 
     fn remove_selected_track(&mut self) {
         let pattern = self.pattern();
         let Some(track) = self.track_at(self.selected_row) else { return };
-        if self.rows().len() <= 1 {
-            return;
-        }
         if self.project.remove_row(pattern, track) {
             self.loaded.remove(track);
             self.send(Command::RemoveTrack(track));
@@ -428,9 +591,10 @@ impl App {
             .collect();
         self.project = project;
         for (track, path) in samples {
-            self.load_sample_into(track, path);
+            self.load_sample(LoadTarget::Track(track), path);
         }
         self.selected_row = 0;
+        self.playing_pattern = self.project.selected_pattern;
         self.relayout();
     }
 
@@ -438,7 +602,7 @@ impl App {
         if !self.confirm_discard() {
             return;
         }
-        self.apply_project(Project::demo());
+        self.apply_project(Project::new());
         self.project_path = None;
         self.dirty = false;
         self.update_title();
@@ -505,9 +669,9 @@ impl App {
     }
 
     fn relayout(&mut self) {
-        let count = self.rows().len();
+        let content = self.content();
         if let Some(gpu) = &mut self.gpu {
-            gpu.track_count = count;
+            gpu.content = content;
             let size = gpu.window.inner_size();
             gpu.resize(size);
         }
@@ -523,47 +687,66 @@ impl App {
             }
             return;
         }
-        if let Some(track) = self.track_at(self.selected_row) {
-            self.load_sample_into(track, path);
-        }
+        let target = match self.track_at(self.selected_row) {
+            Some(track) => LoadTarget::Track(track),
+            None => LoadTarget::NewTrack { pattern: self.pattern() },
+        };
+        self.load_sample(target, path);
     }
 
-    fn load_sample_into(&mut self, track: usize, path: PathBuf) {
+    fn load_sample(&mut self, target: LoadTarget, path: PathBuf) {
         let generation = self.generation;
         let tx = self.loads_tx.clone();
         std::thread::spawn(move || {
             let sample = refraktal_io::load_sample(&path);
-            let _ = tx.send(LoadResult { generation, track, path, sample });
+            let _ = tx.send(LoadResult { generation, target, path, sample });
         });
     }
 
     fn finish_loads(&mut self) {
         while let Ok(result) = self.loads_rx.try_recv() {
             let name = file_name(&result.path);
-            if result.generation != self.generation || result.track >= self.project.tracks.len() {
+            if result.generation != self.generation {
                 continue; // another project was opened, or tracks were removed
             }
-            match result.sample {
-                Ok(sample) => {
-                    let track = &mut self.project.tracks[result.track];
-                    let changed = track.sample.as_deref() != Some(result.path.as_path());
-                    track.sample = Some(result.path.clone());
-                    self.loaded[result.track] = true;
-                    self.send(Command::SetSample { track: result.track, sample: Some(Arc::new(sample)) });
-                    if changed {
-                        self.mark_dirty();
-                    }
-                    let row = self.rows().iter().position(|&t| t == result.track);
-                    self.notify(match row {
-                        Some(row) => format!("Loaded {name} on track {}", row + 1),
-                        None => format!("Loaded {name}"),
-                    });
-                }
+            let sample = match result.sample {
+                Ok(sample) => sample,
                 Err(err) => {
                     eprintln!("Could not load {name}: {err:#}");
                     self.notify(format!("Could not load {name}: {err}"));
+                    continue;
                 }
+            };
+            let track = match result.target {
+                LoadTarget::Track(track) if track < self.project.tracks.len() => track,
+                LoadTarget::Track(_) => continue,
+                LoadTarget::NewTrack { pattern } => {
+                    if pattern != self.pattern() {
+                        continue; // the user moved on to another pattern
+                    }
+                    // A sample track gets a color no built-in sound uses.
+                    let used: Vec<u8> = self.rows().iter().map(|&t| self.project.tracks[t].color).collect();
+                    let color = (DrumKind::ALL.len() as u8..MAX_ROWS as u8).find(|c| !used.contains(c)).unwrap_or(7);
+                    match self.push_track(TrackData::new(Instrument::drum(DrumKind::Kick.name()), color)) {
+                        Some(track) => track,
+                        None => continue,
+                    }
+                }
+            };
+            let data = &mut self.project.tracks[track];
+            let changed = data.sample.as_deref() != Some(result.path.as_path());
+            data.sample = Some(result.path.clone());
+            self.loaded[track] = true;
+            self.send(Command::SetSample { track, sample: Some(Arc::new(sample)) });
+            self.send(Command::Trigger(track));
+            if changed {
+                self.mark_dirty();
             }
+            let row = self.rows().iter().position(|&t| t == track);
+            self.notify(match row {
+                Some(row) => format!("Loaded {name} on track {}", row + 1),
+                None => format!("Loaded {name}"),
+            });
         }
     }
 
@@ -580,12 +763,14 @@ impl App {
 
     fn redraw(&mut self) {
         self.finish_loads();
+        self.finish_exports();
         // Free samples the engine has replaced; never done on the audio thread.
         self.audio.handle.collect_garbage();
         while let Some(event) = self.audio.handle.poll_event() {
             match event {
                 Event::Step(step) if self.playing => self.current_step = Some(step),
-                _ => {}
+                Event::Pattern(pattern) => self.playing_pattern = pattern,
+                Event::Step(_) => {}
             }
         }
 
@@ -613,6 +798,17 @@ impl App {
             file_hover: self.file_hover,
             touch: self.touch,
             autosave: self.autosave.is_some(),
+            pattern_count: self.project.patterns.len(),
+            selected_pattern: pattern,
+            playing_pattern: self.playing_pattern,
+            shared_tracks: self.project.sharing == Sharing::Shared,
+            sounds: sound_chips()
+                .into_iter()
+                .map(|chip| match chip {
+                    SoundChip::Drum(kind) => (kind.name().to_owned(), Some(sound_color(kind))),
+                    SoundChip::SampleFile => ("Sample…".to_owned(), None),
+                })
+                .collect(),
         };
         if let Some(gpu) = &mut self.gpu {
             gpu.render(&frame_state);
@@ -625,7 +821,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match Gpu::new(event_loop, &self.title(), self.rows().len()) {
+        match Gpu::new(event_loop, &self.title(), self.content()) {
             Ok(gpu) => self.gpu = Some(gpu),
             Err(err) => {
                 self.error = Some(err);
@@ -693,6 +889,7 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::KeyO => self.open_project(),
                         KeyCode::KeyN => self.new_project(),
+                        KeyCode::KeyE => self.export(),
                         _ => {}
                     }
                     return;
@@ -704,7 +901,6 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowUp => self.change_bpm(BPM_STEP),
                     KeyCode::ArrowDown => self.change_bpm(-BPM_STEP),
                     KeyCode::Delete | KeyCode::Backspace => self.remove_selected_track(),
-                    KeyCode::Equal | KeyCode::NumpadAdd => self.add_track(),
                     _ => {
                         if let Some(row) = digit(code).map(|n| n - 1) {
                             if let Some(track) = self.track_at(row) {
@@ -738,7 +934,7 @@ impl ApplicationHandler for App {
 }
 
 impl Gpu {
-    fn new(event_loop: &ActiveEventLoop, title: &str, track_count: usize) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, title: &str, content: Content) -> Result<Self> {
         let attributes = Window::default_attributes()
             .with_title(title)
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
@@ -783,14 +979,9 @@ impl Gpu {
         surface.configure(&device, &config);
 
         let renderer = Renderer::new(&device, format, config.width, config.height);
-        let layout = Layout::compute(
-            config.width as f32,
-            config.height as f32,
-            window.scale_factor() as f32,
-            track_count,
-        );
+        let layout = Layout::compute(config.width as f32, config.height as f32, window.scale_factor() as f32, content);
 
-        Ok(Self { window, surface, device, queue, config, renderer, layout, track_count })
+        Ok(Self { window, surface, device, queue, config, renderer, layout, content })
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -801,12 +992,8 @@ impl Gpu {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.renderer.resize(&self.device, size.width, size.height);
-        self.layout = Layout::compute(
-            size.width as f32,
-            size.height as f32,
-            self.window.scale_factor() as f32,
-            self.track_count,
-        );
+        self.layout =
+            Layout::compute(size.width as f32, size.height as f32, self.window.scale_factor() as f32, self.content);
     }
 
     fn render(&mut self, frame_state: &FrameState) {

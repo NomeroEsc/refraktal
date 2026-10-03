@@ -86,19 +86,51 @@ fn track_color(track: u32) -> vec3<f32> {
     return palette((g.colors.x >> (track * 4u)) & 15u);
 }
 
-fn draw_add_button(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
-    if (g.add.w < 0.5) {
-        return col_in;
-    }
+// Chip flags; keep in sync with renderer.rs.
+const CHIP_SELECTED: u32 = 1u;
+const CHIP_PLAYING: u32 = 2u;
+const CHIP_HOVERED: u32 = 4u;
+const CHIP_COLORED: u32 = 8u;
+
+// Pattern and sound chips: small glass-edged pills. Labels are text.
+fn draw_chips(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
     let s = g.screen.w;
-    let rel = p - g.add.xy;
-    let d = length(rel) - g.add.z;
-    let hovered = g.hover.w > 0.5;
-    var col = mix(col_in, col_in + vec3<f32>(select(0.04, 0.10, hovered)), fill(d));
-    col += vec3<f32>(1.0) * fill(abs(d + 0.5 * s) - 0.5 * s) * select(0.22, 0.5, hovered);
-    let arm = g.add.z * 0.45;
-    let plus = min(sd_box(rel, vec2<f32>(arm, 0.9 * s)), sd_box(rel, vec2<f32>(0.9 * s, arm)));
-    col = mix(col, vec3<f32>(select(0.7, 1.2, hovered)), fill(plus));
+    let radius = g.browser_info.y;
+    let count = u32(g.browser_info.z);
+    var col = col_in;
+    for (var i = 0u; i < count; i++) {
+        let rect = g.chips[i];
+        // Skip chips that are clearly too far away to touch this pixel.
+        if (rect_sdf(p, rect, radius) > 12.0 * s) {
+            continue;
+        }
+        let flags = g.chip_flags[i / 4u][i % 4u];
+        let selected = (flags & CHIP_SELECTED) != 0u;
+        let hovered = (flags & CHIP_HOVERED) != 0u;
+        let d = rect_sdf(p, rect, radius);
+        if (selected) {
+            col += CYAN * exp(-max(d, 0.0) / (5.0 * s)) * step(0.0, d) * 0.35;
+            col = mix(col, col * 0.6 + CYAN * select(0.30, 0.42, hovered), fill(d));
+            col += CYAN * fill(abs(d + 0.6 * s) - 0.6 * s) * 1.1;
+        } else {
+            col = mix(col, col + vec3<f32>(select(0.05, 0.12, hovered)), fill(d));
+            col += vec3<f32>(1.0) * fill(abs(d + 0.5 * s) - 0.5 * s) * select(0.18, 0.42, hovered);
+        }
+        // The pattern the engine is playing gets a lit bar under its number.
+        if ((flags & CHIP_PLAYING) != 0u) {
+            let bar = vec2<f32>(rect.x + rect.z * 0.5, rect.y + rect.w - 4.5 * s);
+            let bd = sd_round_box(p - bar, vec2<f32>(rect.z * 0.22, 1.0 * s), 1.0 * s);
+            col = mix(col, CYAN * 2.5, fill(bd));
+        }
+        // Sound chips show the color the new track will get.
+        if ((flags & CHIP_COLORED) != 0u) {
+            let color = palette((flags >> 8u) & 15u);
+            let dot = vec2<f32>(rect.x + rect.w * 0.5 + 2.0 * s, rect.y + rect.w * 0.5);
+            let dd = length(p - dot) - 3.5 * s;
+            col += color * exp(-max(dd, 0.0) / (4.0 * s)) * 0.3;
+            col = mix(col, color * 1.4, fill(dd));
+        }
+    }
     return col;
 }
 
@@ -117,7 +149,10 @@ fn draw_cells(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
     let in_beat = bx - beat * beat_stride;
     let col_in_beat = clamp(floor((in_beat + gap * 0.5) / (cell + gap)), 0.0, 3.0);
     let step_f = beat * 4.0 + col_in_beat;
-    let last_track = f32(max(g.tracks.w, 1u) - 1u);
+    if (g.tracks.w == 0u) {
+        return col_in; // an empty pattern: the hint is drawn as text
+    }
+    let last_track = f32(g.tracks.w - 1u);
     let track_f = clamp(floor((p.y - origin.y + row_gap * 0.5) / (cell + row_gap)), 0.0, last_track);
 
     let center = vec2<f32>(
@@ -245,10 +280,19 @@ fn draw_transport(col_in: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
     col = small_button(col, p, vec2<f32>(g.tempo_buttons.x, g.tempo_buttons.z), g.tempo_buttons.w, 2.0, 1);
     col = small_button(col, p, vec2<f32>(g.tempo_buttons.y, g.tempo_buttons.z), g.tempo_buttons.w, 3.0, 2);
     col = small_button(col, p, g.help_button.xy, g.help_button.z, 4.0, 0);
+    col = small_button(col, p, g.export_button.xy, g.export_button.z, 5.0, 3);
     return col;
 }
 
-// A round button; `icon` 1 draws a minus, 2 a plus, 0 nothing (text goes on top).
+fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// A round button; `icon` 1 draws a minus, 2 a plus, 3 a download arrow,
+// 0 nothing (text goes on top).
 fn small_button(col_in: vec3<f32>, p: vec2<f32>, center: vec2<f32>, r: f32, id: f32, icon: i32) -> vec3<f32> {
     let s = g.screen.w;
     let rel = p - center;
@@ -264,6 +308,15 @@ fn small_button(col_in: vec3<f32>, p: vec2<f32>, center: vec2<f32>, r: f32, id: 
     if (icon == 2) {
         shape = min(shape, sd_box(rel, vec2<f32>(0.9 * s, arm)));
     }
+    if (icon == 3) {
+        // An arrow pointing down into a tray.
+        shape = 1e5;
+        let w = 0.85 * s;
+        shape = min(shape, sd_segment(rel, vec2<f32>(0.0, -0.46 * r), vec2<f32>(0.0, 0.16 * r)) - w);
+        shape = min(shape, sd_segment(rel, vec2<f32>(-0.26 * r, -0.06 * r), vec2<f32>(0.0, 0.2 * r)) - w);
+        shape = min(shape, sd_segment(rel, vec2<f32>(0.26 * r, -0.06 * r), vec2<f32>(0.0, 0.2 * r)) - w);
+        shape = min(shape, sd_segment(rel, vec2<f32>(-0.4 * r, 0.44 * r), vec2<f32>(0.4 * r, 0.44 * r)) - w);
+    }
     col = mix(col, vec3<f32>(select(0.75, 1.2, hovered)), fill(shape));
     return col;
 }
@@ -274,13 +327,17 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var col = sample_scene(p);
 
     col = shadow(col, p, g.sequencer, g.radii.x);
+    col = shadow(col, p, g.browser, g.browser_info.x);
     col = shadow(col, p, g.transport, g.radii.y);
     col = glass(col, p, g.sequencer, g.radii.x);
+    col = glass(col, p, g.browser, g.browser_info.x);
     col = glass(col, p, g.transport, g.radii.y);
 
     if (rect_sdf(p, g.sequencer, g.radii.x) < 24.0 * g.screen.w) {
         col = draw_cells(col, p);
-        col = draw_add_button(col, p);
+    }
+    if (rect_sdf(p, g.browser, g.browser_info.x) < 0.0) {
+        col = draw_chips(col, p);
     }
     if (rect_sdf(p, g.transport, g.radii.y) < 0.0) {
         col = draw_transport(col, p);

@@ -11,6 +11,9 @@ pub enum Answer {
     Cancel,
 }
 
+/// Whether this platform has file dialogs (sample picking, export).
+pub const CAN_PICK_FILES: bool = cfg!(not(target_os = "android"));
+
 #[cfg(not(target_os = "android"))]
 mod imp {
     use super::{Answer, PathBuf};
@@ -29,6 +32,21 @@ mod imp {
             .set_title("Save project")
             .add_filter("Refraktal project", &[PROJECT_EXTENSION])
             .set_file_name(format!("beat.{PROJECT_EXTENSION}"))
+            .save_file()
+    }
+
+    pub fn pick_sample_to_open() -> Option<PathBuf> {
+        FileDialog::new()
+            .set_title("Add a sample")
+            .add_filter("Audio", &["wav", "flac", "mp3", "ogg"])
+            .pick_file()
+    }
+
+    pub fn pick_wav_to_save() -> Option<PathBuf> {
+        FileDialog::new()
+            .set_title("Export to WAV")
+            .add_filter("WAV audio", &["wav"])
+            .set_file_name("beat.wav")
             .save_file()
     }
 
@@ -65,6 +83,14 @@ mod imp {
     }
 
     pub fn pick_project_to_save() -> Option<PathBuf> {
+        None
+    }
+
+    pub fn pick_sample_to_open() -> Option<PathBuf> {
+        None
+    }
+
+    pub fn pick_wav_to_save() -> Option<PathBuf> {
         None
     }
 

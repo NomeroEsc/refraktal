@@ -4,7 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::layout::{Hit, Layout, MAX_TRACKS, STEPS};
+use crate::layout::{Chip, Hit, Layout, MAX_CHIPS, MAX_TRACKS, STEPS};
 use crate::text::TextRenderer;
 
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -48,6 +48,18 @@ pub struct FrameState {
     pub autosave: bool,
     /// A short message under the sequencer and its opacity (0–1).
     pub status: Option<(String, f32)>,
+    /// Patterns in the project.
+    pub pattern_count: usize,
+    /// The pattern being edited.
+    pub selected_pattern: usize,
+    /// The pattern the engine plays; differs from the selected one until
+    /// the current bar ends.
+    pub playing_pattern: usize,
+    /// Every track is in every pattern (otherwise each pattern has its own).
+    pub shared_tracks: bool,
+    /// Labels of the sound chips, and the palette color of each (`None`
+    /// for chips that are not a sound, like "Sample…").
+    pub sounds: Vec<(String, Option<u8>)>,
 }
 
 /// Must match `struct Globals` in `shaders/common.wgsl`.
@@ -66,12 +78,27 @@ struct Globals {
     pattern: [[u32; 4]; 2],
     tracks: [u32; 4],
     colors: [u32; 4],
-    add: [f32; 4],
     overlay: [f32; 4],
     overlay_info: [f32; 4],
     tempo_buttons: [f32; 4],
     help_button: [f32; 4],
+    export_button: [f32; 4],
+    browser: [f32; 4],
+    browser_info: [f32; 4],
+    chips: [[f32; 4]; MAX_CHIPS],
+    chip_flags: [[u32; 4]; MAX_CHIPS / 4],
 }
+
+// `common.wgsl` sizes the chip arrays with literals.
+const _: () = assert!(MAX_CHIPS == 24);
+
+// Chip flags; keep in sync with `composite.wgsl`.
+const CHIP_SELECTED: u32 = 1;
+const CHIP_PLAYING: u32 = 2;
+const CHIP_HOVERED: u32 = 4;
+const CHIP_COLORED: u32 = 8;
+/// Palette index of a colored chip, in bits 8 to 11.
+const CHIP_COLOR_SHIFT: u32 = 8;
 
 /// Must match `struct BlurParams` in `shaders/blur.wgsl`.
 #[repr(C)]
@@ -289,16 +316,16 @@ impl Renderer {
     }
 
     fn globals(&self, layout: &Layout, frame: &FrameState) -> Globals {
-        // hover.z identifies a transport button: 1 play, 2 tempo down, 3 tempo up, 4 help.
-        let (hover_track, hover_step, hover_button, hover_add) = match frame.hover {
-            Hit::Step { track, step } => (track as f32, step as f32, 0.0, 0.0),
-            Hit::Play => (-1.0, -1.0, 1.0, 0.0),
-            Hit::TempoDown => (-1.0, -1.0, 2.0, 0.0),
-            Hit::TempoUp => (-1.0, -1.0, 3.0, 0.0),
-            Hit::Help => (-1.0, -1.0, 4.0, 0.0),
-            Hit::AddTrack => (-1.0, -1.0, 0.0, 1.0),
-            Hit::Track(track) => (track as f32, -1.0, 0.0, 0.0),
-            Hit::None => (-1.0, -1.0, 0.0, 0.0),
+        // hover.z identifies a transport button: 1 play, 2 tempo down, 3 tempo up, 4 help, 5 export.
+        let (hover_track, hover_step, hover_button) = match frame.hover {
+            Hit::Step { track, step } => (track as f32, step as f32, 0.0),
+            Hit::Play => (-1.0, -1.0, 1.0),
+            Hit::TempoDown => (-1.0, -1.0, 2.0),
+            Hit::TempoUp => (-1.0, -1.0, 3.0),
+            Hit::Help => (-1.0, -1.0, 4.0),
+            Hit::Export => (-1.0, -1.0, 5.0),
+            Hit::Track(track) => (track as f32, -1.0, 0.0),
+            Hit::Chip(_) | Hit::None => (-1.0, -1.0, 0.0),
         };
         let current = match (frame.playing, frame.current_step) {
             (true, Some(step)) => step as f32,
@@ -317,10 +344,29 @@ impl Renderer {
             .iter()
             .enumerate()
             .fold(0_u32, |packed, (i, &c)| packed | (u32::from(c) & 0xF) << (i * 4));
-        let add = match layout.add_button {
-            Some((x, y, r)) => [x, y, r, 1.0],
-            None => [0.0, 0.0, 0.0, 0.0],
-        };
+        let mut chips = [[0.0_f32; 4]; MAX_CHIPS];
+        let mut chip_flags = [[0_u32; 4]; MAX_CHIPS / 4];
+        for (i, slot) in layout.chips().iter().enumerate() {
+            chips[i] = slot.rect.to_array();
+            let mut flags = if frame.hover == Hit::Chip(slot.chip) { CHIP_HOVERED } else { 0 };
+            match slot.chip {
+                Chip::Pattern(p) => {
+                    if p == frame.selected_pattern {
+                        flags |= CHIP_SELECTED;
+                    }
+                    if p == frame.playing_pattern && frame.playing {
+                        flags |= CHIP_PLAYING;
+                    }
+                }
+                Chip::Sound(n) => {
+                    if let Some((_, Some(color))) = frame.sounds.get(n) {
+                        flags |= CHIP_COLORED | (u32::from(*color) & 0xF) << CHIP_COLOR_SHIFT;
+                    }
+                }
+                Chip::AddPattern | Chip::Sharing => {}
+            }
+            chip_flags[i / 4][i % 4] = flags;
+        }
 
         let sample_mask = frame
             .sample_loaded
@@ -342,7 +388,7 @@ impl Renderer {
             grid: [layout.grid_origin.0, layout.grid_origin.1, layout.cell, layout.gap],
             grid2: [layout.beat_gap, layout.row_gap, layout.label_x, current],
             dots: layout.dots,
-            hover: [hover_track, hover_step, hover_button, hover_add],
+            hover: [hover_track, hover_step, hover_button, 0.0],
             pattern,
             tracks: [
                 frame.selected_track as u32,
@@ -351,11 +397,20 @@ impl Renderer {
                 layout.track_count as u32,
             ],
             colors: [packed_colors, 0, 0, 0],
-            add,
             overlay: layout.help.to_array(),
             overlay_info: [if frame.help_visible { 1.0 } else { 0.0 }, 28.0 * layout.scale, 0.0, 0.0],
             tempo_buttons: layout.tempo_buttons,
             help_button: [layout.help_button.0, layout.help_button.1, layout.help_button.2, 0.0],
+            export_button: [layout.export_button.0, layout.export_button.1, layout.export_button.2, 0.0],
+            browser: layout.browser.to_array(),
+            browser_info: [
+                layout.panel_radius * 0.8,
+                layout.chips().first().map_or(0.0, |c| c.rect.h * 0.5),
+                layout.chip_count as f32,
+                0.0,
+            ],
+            chips,
+            chip_flags,
         }
     }
 }

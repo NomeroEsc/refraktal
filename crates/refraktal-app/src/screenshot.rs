@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use anyhow::{Context, Result, anyhow};
 use refraktal_io::Project;
-use refraktal_ui::{FrameState, Hit, Layout, MAX_TRACKS, Renderer, STEPS};
+use refraktal_ui::{Content, FrameState, Hit, Layout, MAX_TRACKS, Renderer, STEPS};
 
 pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, touch: bool) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -34,7 +34,14 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
 
     let mut renderer = Renderer::new(&device, format, width, height);
     let track_count = 4;
-    let layout = Layout::compute(width as f32, height as f32, scale, track_count);
+    let sounds: Vec<(String, Option<u8>)> = ["kick", "snare", "hat", "clap", "tom"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| ((*name).to_owned(), Some(i as u8)))
+        .chain(std::iter::once(("Sample…".to_owned(), None)))
+        .collect();
+    let content = Content { tracks: track_count, patterns: 3, sounds: sounds.len() };
+    let layout = Layout::compute(width as f32, height as f32, scale, content);
     let mut pattern = [[false; STEPS]; MAX_TRACKS];
     for (row, steps) in Project::demo().patterns[0].steps.iter().flatten().enumerate() {
         pattern[row] = *steps;
@@ -48,7 +55,7 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
         current_step: Some(4),
         pattern,
         track_count,
-        colors: [0, 1, 2, 4, 0, 0, 0, 0],
+        colors: [0, 1, 2, 3, 0, 0, 0, 0],
         hover: Hit::None,
         selected_track: 3,
         sample_loaded: std::array::from_fn(|i| i == 0),
@@ -59,6 +66,11 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
         touch,
         autosave: touch,
         status: None,
+        pattern_count: 3,
+        selected_pattern: 0,
+        playing_pattern: 0,
+        shared_tracks: true,
+        sounds,
     };
 
     // Rows in a texture-to-buffer copy must be aligned to 256 bytes.

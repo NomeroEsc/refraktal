@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! All text on screen: tempo, track names, status line and the help overlay.
 
-use crate::layout::{HELP_ROWS, Layout};
+use crate::layout::{Chip, HELP_ROWS, Layout, TOUCH_HELP_ROWS};
 use crate::renderer::FrameState;
 use crate::text::{Align, TextRenderer, Weight};
 
@@ -10,14 +10,15 @@ const DIM: [f32; 4] = [0.62, 0.58, 0.78, 1.0];
 const FAINT: [f32; 4] = [0.45, 0.42, 0.60, 1.0];
 
 /// Gesture, then what it does, for touch screens.
-const TOUCH_HELP: [(&str, &str); 9] = [
+const TOUCH_HELP: [(&str, &str); TOUCH_HELP_ROWS] = [
     ("Tap a cell", "Turn a step on or off"),
     ("Tap the play button", "Play or stop"),
     ("Tap  −  or  +", "Tempo down or up by 5 BPM"),
+    ("Tap a sound", "Add a track with that sound"),
     ("Tap a dot", "Select a track and hear it"),
     ("Tap the selected dot", "Switch to the next built-in sound"),
-    ("Tap + under the tracks", "Add a track"),
     ("Hold a dot", "Remove the track"),
+    ("Tap a pattern, hold it", "Switch to it, delete it"),
     ("Tap ?", "Show or hide this help"),
     ("", "Your beat is saved when you leave the app"),
 ];
@@ -29,12 +30,14 @@ const HELP: [(&str, &str); HELP_ROWS] = [
     ("↑  ↓", "Tempo up or down by 5 BPM"),
     ("1 to 8, or click a dot", "Select a track and hear it"),
     ("Click the selected dot", "Switch to the next built-in sound"),
-    ("+", "Add a track"),
+    ("Click a sound", "Add a track with that sound"),
+    ("Click a pattern, right-click", "Switch to it, delete it"),
     ("Delete", "Remove the selected track"),
     ("Drop an audio file", "Play it on the selected track"),
     ("Right-click a dot", "Remove its sample, or the track"),
     ("Ctrl+S,  Ctrl+Shift+S", "Save, save as"),
     ("Ctrl+O,  Ctrl+N", "Open a project, start a new one"),
+    ("Ctrl+E", "Export the pattern to WAV"),
     ("F1, Esc or ?", "Close this help"),
 ];
 
@@ -57,12 +60,19 @@ pub(crate) fn queue(text: &mut TextRenderer, layout: &Layout, frame: &FrameState
     text.queue(" BPM", bx, by, 12.0 * s, Weight::Regular, DIM, Align::Right);
     text.queue(&format!("{:.0}", frame.bpm), bx - unit_w, by, 21.0 * s, Weight::Bold, BRIGHT, Align::Right);
 
-    // Track names.
+    // Track names, or a hint in an empty pattern.
     for (track, label) in frame.track_labels.iter().enumerate().take(layout.track_count) {
         let color = if track == frame.selected_track { BRIGHT } else { DIM };
         let label = truncate(label, 10);
         text.queue(&label, layout.name_x, layout.row_baseline(track), 14.0 * s, Weight::Regular, color, Align::Left);
     }
+    if layout.track_count == 0 {
+        let panel = layout.sequencer;
+        let (x, y) = (panel.x + panel.w * 0.5, panel.y + panel.h * 0.5 + 5.0 * s);
+        text.queue("Pick a sound above to add a track", x, y, 15.0 * s, Weight::Regular, DIM, Align::Center);
+    }
+
+    queue_chips(text, layout, frame);
 
     // Status line: a recent message, otherwise a pointer to the help.
     let (sx, sy) = layout.status_anchor;
@@ -75,6 +85,39 @@ pub(crate) fn queue(text: &mut TextRenderer, layout: &Layout, frame: &FrameState
             text.queue("Press F1 for help", sx, sy, 13.0 * s, Weight::Regular, FAINT, Align::Center);
         }
         None => {}
+    }
+}
+
+fn queue_chips(text: &mut TextRenderer, layout: &Layout, frame: &FrameState) {
+    let s = layout.scale;
+    if let Some((x, y1, y2)) = layout.row_titles {
+        text.queue("Patterns", x, y1, 12.0 * s, Weight::Regular, FAINT, Align::Left);
+        text.queue("Sounds", x, y2, 12.0 * s, Weight::Regular, FAINT, Align::Left);
+    }
+    let size = if layout.compact { 12.5 } else { 13.5 } * s;
+    for slot in layout.chips() {
+        let r = slot.rect;
+        let (cx, baseline) = (r.x + r.w * 0.5, r.y + r.h * 0.5 + size * 0.36);
+        match slot.chip {
+            Chip::Pattern(p) => {
+                let color = if p == frame.selected_pattern { BRIGHT } else { DIM };
+                text.queue(&(p + 1).to_string(), cx, baseline, size, Weight::Bold, color, Align::Center);
+            }
+            Chip::AddPattern => {
+                text.queue("+", cx, baseline, size * 1.2, Weight::Bold, DIM, Align::Center);
+            }
+            Chip::Sharing => {
+                let label = if frame.shared_tracks { "Shared tracks" } else { "Own tracks" };
+                text.queue(label, cx, baseline, size, Weight::Regular, DIM, Align::Center);
+            }
+            Chip::Sound(n) => {
+                if let Some((label, color)) = frame.sounds.get(n) {
+                    // Colored chips have a dot on the left; move the text over.
+                    let x = if color.is_some() { cx + 5.0 * s } else { cx };
+                    text.queue(label, x, baseline, size, Weight::Regular, BRIGHT, Align::Center);
+                }
+            }
+        }
     }
 }
 

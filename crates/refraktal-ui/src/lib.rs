@@ -16,5 +16,5 @@ mod layout;
 mod renderer;
 mod text;
 
-pub use layout::{Hit, Layout, MAX_TRACKS, Rect, STEPS};
+pub use layout::{Chip, ChipSlot, Content, Hit, Layout, MAX_PATTERNS, MAX_SOUNDS, MAX_TRACKS, Rect, STEPS};
 pub use renderer::{FrameState, Renderer};

@@ -10,15 +10,19 @@ struct Globals {
     grid: vec4<f32>,       // origin x, origin y, cell, gap
     grid2: vec4<f32>,      // beat gap, row gap, label x, current step (-1 = none)
     dots: vec4<f32>,       // first x, last x, y, radius
-    hover: vec4<f32>,      // track, step, play hovered (0/1), add hovered (0/1)
+    hover: vec4<f32>,      // track, step, transport button id (see renderer.rs), -
     pattern: array<vec4<u32>, 2>, // one 16-bit step mask per track slot
     tracks: vec4<u32>,     // selected track, sample-loaded mask, file hover (0/1), track count
     colors: vec4<u32>,     // x: 4-bit palette index per track
-    add: vec4<f32>,        // "+" button: center x, center y, radius, visible (0/1)
     overlay: vec4<f32>,    // help panel rect
     overlay_info: vec4<f32>, // visible (0/1), corner radius, -, -
     tempo_buttons: vec4<f32>, // minus x, plus x, y, radius
     help_button: vec4<f32>,   // x, y, radius, -
+    export_button: vec4<f32>, // x, y, radius, -
+    browser: vec4<f32>,       // pattern and sound panel rect
+    browser_info: vec4<f32>,  // panel radius, chip radius, chip count, -
+    chips: array<vec4<f32>, 24>,     // chip rects
+    chip_flags: array<vec4<u32>, 6>, // one flag word per chip, see renderer.rs
 };
 
 // Linear-light neon palette.

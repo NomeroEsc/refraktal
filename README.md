@@ -66,7 +66,12 @@ a console window, so use a debug build for `--cli` there.
 | `↑` / `↓`             | tempo ±5 BPM              |
 | click a track dot / `1`–`8` | select and preview a track |
 | click the selected dot again | switch its built-in sound (kick, snare, hat, clap, tom) |
-| click `+` / `+` key   | add a track (up to 8)     |
+| click a sound (kick, snare, …) | add a track with it (up to 8 per pattern) |
+| click `Sample…`       | add a track that plays an audio file |
+| click a pattern number / `+` | switch pattern / add one (16 at most) |
+| right-click a pattern number | delete that pattern |
+| click `Shared tracks` / `Own tracks` | switch: every track in every pattern, or tracks per pattern |
+| click ⤓ / `Ctrl+E`    | export the pattern to WAV |
 | `Delete` / `Backspace` | remove the selected track |
 | `Ctrl+S` / `Ctrl+Shift+S` | save / save as         |
 | `Ctrl+O`, or drop a `.refraktal` file | open a project |
