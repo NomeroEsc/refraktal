@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Export a project to WAV (48 kHz, 16-bit stereo) from the command line:
+  `refraktal --export beat.refraktal beat.wav`. The pattern plays four times,
+  then the last hits ring out. Exports sound exactly like playback.
+
 ## 0.1.0-alpha.1
 
 First public preview. Expect rough edges.

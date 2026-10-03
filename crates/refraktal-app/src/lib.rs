@@ -5,6 +5,7 @@
 
 mod audio;
 mod dialogs;
+mod export;
 mod gui;
 
 #[cfg(not(target_os = "android"))]
@@ -31,6 +32,7 @@ Usage: refraktal [options]
 
 Options:
   --cli                     text interface instead of the window
+  --export <project> <wav>  render a project to a WAV file and exit
   --screenshot <file.png>   render one frame to a PNG and exit
   --size <W>x<H>            screenshot size in pixels (default 1600x1000)
   --scale <factor>          screenshot UI scale (default 1)
@@ -43,6 +45,7 @@ Options:
 enum Mode {
     Gui,
     Cli,
+    Export { project: PathBuf, wav: PathBuf },
     Screenshot { path: PathBuf, width: u32, height: u32, scale: f32, show_help: bool, touch: bool },
 }
 
@@ -61,6 +64,11 @@ pub fn run_desktop() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cli" => mode = Mode::Cli,
+            "--export" => {
+                let project = args.next().context("--export needs a project file")?;
+                let wav = args.next().context("--export needs an output file, e.g. beat.wav")?;
+                mode = Mode::Export { project: PathBuf::from(project), wav: PathBuf::from(wav) };
+            }
             "--show-help" => show_help = true,
             "--touch" => touch = true,
             "-v" | "--verbose" => verbose = true,
@@ -87,6 +95,17 @@ pub fn run_desktop() -> Result<()> {
     match mode {
         Mode::Screenshot { path, width, height, scale, show_help, touch } => {
             screenshot::run(&path, width, height, scale, show_help, touch)
+        }
+        Mode::Export { project, wav } => {
+            let rendered = export::export_file(&project, &wav)?;
+            println!(
+                "Exported {}: {:.1} s ({} loops, then a {:.1} s tail)",
+                wav.display(),
+                rendered.seconds(),
+                export::EXPORT_LOOPS,
+                rendered.tail_seconds(),
+            );
+            Ok(())
         }
         Mode::Cli => {
             let mut audio = audio::start(verbose)?;

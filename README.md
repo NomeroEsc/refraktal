@@ -79,7 +79,9 @@ keep samples next to the project if you want to move or share it.
 | right-click a track dot | back to the built-in sound |
 
 Run `cargo run -- --help` for options, e.g. `--screenshot shot.png` renders
-one frame to a file and `--cli` starts the text interface.
+one frame to a file, `--export beat.refraktal beat.wav` renders a project to
+a WAV file (the pattern four times, then the tail of the last hits) and
+`--cli` starts the text interface.
 
 ## Text interface commands
 

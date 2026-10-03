@@ -294,6 +294,25 @@ impl Engine {
         }
     }
 
+    /// Frames that [`process`](Self::process) will render before the next
+    /// step fires, or `None` when stopped. An offline renderer uses this to
+    /// stop exactly at a pattern boundary. Commands still waiting in the
+    /// queue are not taken into account.
+    #[must_use]
+    pub fn frames_until_step(&self) -> Option<usize> {
+        // `process` fires on the first frame whose counter is <= 0 and then
+        // counts down by one per frame, so the answer is ceil(counter).
+        self.playing.then(|| {
+            if self.samples_until_step <= 0.0 { 0 } else { self.samples_until_step.ceil() as usize }
+        })
+    }
+
+    /// Index of the step that fires next.
+    #[must_use]
+    pub fn next_step(&self) -> usize {
+        self.step
+    }
+
     fn apply(&mut self, cmd: Command) {
         match cmd {
             Command::Play => {
@@ -550,6 +569,27 @@ mod tests {
         }
         engine.process(&mut buf, 2);
         assert_eq!(engine.track_count, 1);
+    }
+
+    #[test]
+    fn frames_until_step_predicts_the_next_step() {
+        // Includes tempos where a step is not a whole number of frames.
+        for bpm in [120.0, 133.0, 97.3, 300.0] {
+            let (mut engine, mut handle) = Engine::new(44_100.0);
+            assert_eq!(engine.frames_until_step(), None);
+            handle.send(Command::SetBpm(bpm)).unwrap();
+            handle.send(Command::Play).unwrap();
+            engine.process(&mut [], 1);
+            for expected_step in 0..40 {
+                let n = engine.frames_until_step().unwrap();
+                let mut buf = vec![0.0; n];
+                engine.process(&mut buf, 1);
+                assert_eq!(handle.poll_event(), None, "a step fired early at {bpm} BPM");
+                assert_eq!(engine.next_step(), expected_step % STEPS);
+                engine.process(&mut [0.0], 1);
+                assert_eq!(handle.poll_event(), Some(Event::Step(expected_step % STEPS)), "at {bpm} BPM");
+            }
+        }
     }
 
     #[test]

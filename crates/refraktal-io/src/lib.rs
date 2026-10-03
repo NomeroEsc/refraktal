@@ -4,6 +4,8 @@
 
 mod project;
 mod sample;
+mod wav;
 
 pub use project::{PROJECT_EXTENSION, Project, TrackData};
 pub use sample::{MAX_SAMPLE_SECONDS, load_sample};
+pub use wav::{encode_wav, save_wav};

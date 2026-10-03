@@ -20,10 +20,11 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::audio::Audio;
 use crate::dialogs::{self, Answer};
+use crate::export;
 
 const DEFAULT_BPM: f32 = 120.0;
-const MIN_BPM: f32 = 40.0;
-const MAX_BPM: f32 = 300.0;
+pub(crate) const MIN_BPM: f32 = 40.0;
+pub(crate) const MAX_BPM: f32 = 300.0;
 const BPM_STEP: f32 = 5.0;
 /// How long a status message stays, including its fade-out.
 const STATUS_TIME: Duration = Duration::from_millis(3000);
@@ -414,22 +415,18 @@ impl App {
         self.playing = false;
         self.current_step = None;
 
-        let kind_of = |t: &TrackData| DrumKind::from_name(&t.sound).unwrap_or(DrumKind::Kick);
         self.pattern = [[false; STEPS]; MAX_TRACKS];
         self.tracks.clear();
         for (index, data) in project.tracks.iter().take(MAX_TRACKS).enumerate() {
-            let kind = kind_of(data);
-            self.send(if index == 0 { Command::Reset(kind) } else { Command::AddTrack(kind) });
+            let kind = export::drum_kind(&data.sound);
             self.tracks.push(TrackState { kind, sample_loaded: false, sample_path: None, color: data.color });
-            for (step, &on) in data.steps.iter().enumerate() {
-                if on {
-                    self.pattern[index][step] = true;
-                    self.send(Command::SetStep { track: index, step, on });
-                }
-            }
+            self.pattern[index] = data.steps;
         }
-        self.bpm = project.bpm.clamp(MIN_BPM, MAX_BPM);
-        self.send(Command::SetBpm(self.bpm));
+        self.bpm = export::project_bpm(project);
+        // The same commands the exporter uses, so export matches playback.
+        for cmd in export::project_commands(project) {
+            self.send(cmd);
+        }
 
         for (index, data) in project.tracks.iter().enumerate() {
             if let Some(path) = &data.sample {
