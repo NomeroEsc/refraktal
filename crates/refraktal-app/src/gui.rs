@@ -50,9 +50,24 @@ struct LoadResult {
 
 /// Result of an export on a background thread.
 struct ExportResult {
-    path: PathBuf,
-    /// Length in seconds, or what went wrong.
-    result: anyhow::Result<f32>,
+    /// What to tell the user, or what went wrong.
+    result: anyhow::Result<String>,
+}
+
+/// Save an export on the phone: Downloads/Refraktal, then the share sheet.
+#[cfg(target_os = "android")]
+fn save_on_phone(name: &str, audio: &[f32]) -> anyhow::Result<String> {
+    use crate::android_files::{Outcome, save_to_downloads};
+    let bytes = refraktal_io::encode_wav(audio, export::EXPORT_SAMPLE_RATE)?;
+    Ok(match save_to_downloads(name, "audio/wav", &bytes)? {
+        Outcome::Saved(where_to) => where_to,
+        Outcome::NeedsPermission => "Allow storage access, then tap export again".to_owned(),
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn save_on_phone(_name: &str, _audio: &[f32]) -> anyhow::Result<String> {
+    anyhow::bail!("there is no Downloads folder to save into on this platform")
 }
 
 /// What a chip in the sound row adds.
@@ -82,19 +97,27 @@ pub struct Options {
     pub autosave: Option<PathBuf>,
     /// Start with touch instructions instead of keyboard shortcuts.
     pub touch: bool,
+    /// Show a note about Android developer verification once per version,
+    /// remembering in this file which version it was last shown for.
+    pub notice: Option<PathBuf>,
 }
 
 /// Desktop: open the main window and run until it is closed.
 #[cfg(not(target_os = "android"))]
 pub fn run_desktop(audio: Audio) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create the event loop")?;
-    run(audio, event_loop, Options { autosave: None, touch: false })
+    run(audio, event_loop, Options { autosave: None, touch: false, notice: None })
 }
 
 /// Run the interface on an existing event loop.
 pub fn run(audio: Audio, event_loop: EventLoop<()>, options: Options) -> Result<()> {
     let mut app = App::new(audio);
     app.touch = options.touch;
+    if let Some(path) = options.notice {
+        let seen = std::fs::read_to_string(&path).unwrap_or_default();
+        app.notice_visible = seen.trim() != env!("CARGO_PKG_VERSION");
+        app.notice_file = Some(path);
+    }
     if let Some(path) = options.autosave {
         if path.exists() {
             match Project::load(&path) {
@@ -142,6 +165,9 @@ struct App {
     exports_tx: Sender<ExportResult>,
     exports_rx: Receiver<ExportResult>,
     exporting: bool,
+    /// The note about Android developer verification is on screen.
+    notice_visible: bool,
+    notice_file: Option<PathBuf>,
     file_hover: bool,
     project_path: Option<PathBuf>,
     dirty: bool,
@@ -179,6 +205,8 @@ impl App {
             exports_tx,
             exports_rx,
             exporting: false,
+            notice_visible: false,
+            notice_file: None,
             file_hover: false,
             project_path: None,
             dirty: false,
@@ -307,7 +335,21 @@ impl App {
         }
     }
 
+    /// Close the Android note and remember that this version showed it.
+    fn close_notice(&mut self) {
+        self.notice_visible = false;
+        if let Some(path) = &self.notice_file {
+            if let Err(err) = std::fs::write(path, env!("CARGO_PKG_VERSION")) {
+                eprintln!("Could not remember the notice: {err}");
+            }
+        }
+    }
+
     fn click(&mut self) {
+        if self.notice_visible {
+            self.close_notice();
+            return;
+        }
         if self.help_visible {
             self.help_visible = false;
             return;
@@ -366,6 +408,10 @@ impl App {
     /// Right click (or a long press) on a track marker removes its sample,
     /// or the track itself when it plays a built-in sound.
     fn right_click(&mut self) {
+        if self.notice_visible {
+            self.close_notice();
+            return;
+        }
         if self.help_visible {
             return;
         }
@@ -519,27 +565,37 @@ impl App {
     }
 
     /// Render the selected pattern to a WAV file on a background thread.
+    /// Desktop asks where to save it; Android saves into Downloads.
     fn export(&mut self) {
         if self.exporting {
             return;
         }
-        if !dialogs::CAN_PICK_FILES {
-            self.notify("Export on Android comes with the next update");
-            return;
-        }
-        let Some(path) = dialogs::pick_wav_to_save() else { return };
-        let path = path.with_extension("wav");
+        let target = if dialogs::CAN_PICK_FILES {
+            match dialogs::pick_wav_to_save() {
+                Some(path) => Some(path.with_extension("wav")),
+                None => return,
+            }
+        } else {
+            None
+        };
         let project = self.project.clone();
+        let name = format!("{}.wav", self.project_name());
         let tx = self.exports_tx.clone();
         self.exporting = true;
         self.notify("Exporting…");
         std::thread::spawn(move || {
             let result = export::load_samples(&project).and_then(|samples| {
                 let rendered = export::render(&project, &samples);
-                refraktal_io::save_wav(&path, &rendered.audio, export::EXPORT_SAMPLE_RATE)?;
-                Ok(rendered.seconds())
+                let seconds = rendered.seconds();
+                match target {
+                    Some(path) => {
+                        refraktal_io::save_wav(&path, &rendered.audio, export::EXPORT_SAMPLE_RATE)?;
+                        Ok(format!("Exported {} ({seconds:.1} s)", file_name(&path)))
+                    }
+                    None => save_on_phone(&name, &rendered.audio),
+                }
             });
-            let _ = tx.send(ExportResult { path, result });
+            let _ = tx.send(ExportResult { result });
         });
     }
 
@@ -547,10 +603,18 @@ impl App {
         while let Ok(done) = self.exports_rx.try_recv() {
             self.exporting = false;
             match done.result {
-                Ok(seconds) => self.notify(format!("Exported {} ({seconds:.1} s)", file_name(&done.path))),
+                Ok(message) => self.notify(message),
                 Err(err) => dialogs::show_error("Could not export", &err),
             }
         }
+    }
+
+    /// File name for exports: the project's name, or "beat".
+    fn project_name(&self) -> String {
+        self.project_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .map_or_else(|| "beat".to_owned(), |n| n.to_string_lossy().into_owned())
     }
 
     fn remove_selected_track(&mut self) {
@@ -790,6 +854,7 @@ impl App {
             bpm: self.project.bpm,
             track_labels: rows.iter().map(|&t| self.track_label(t)).collect(),
             help_visible: self.help_visible,
+            notice_visible: self.notice_visible,
             status: self.status_for_frame(),
             track_count: rows.len(),
             colors: std::array::from_fn(|i| rows.get(i).map_or(0, |&t| self.project.tracks[t].color)),
@@ -896,7 +961,12 @@ impl ApplicationHandler for App {
                 }
                 match code {
                     KeyCode::F1 => self.help_visible = !self.help_visible,
-                    KeyCode::Escape => self.help_visible = false,
+                    KeyCode::Escape => {
+                        self.help_visible = false;
+                        if self.notice_visible {
+                            self.close_notice();
+                        }
+                    }
                     KeyCode::Space => self.toggle_play(),
                     KeyCode::ArrowUp => self.change_bpm(BPM_STEP),
                     KeyCode::ArrowDown => self.change_bpm(-BPM_STEP),

@@ -11,7 +11,15 @@ use anyhow::{Context, Result, anyhow};
 use refraktal_io::Project;
 use refraktal_ui::{Content, FrameState, Hit, Layout, MAX_TRACKS, Renderer, STEPS};
 
-pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, touch: bool) -> Result<()> {
+/// An overlay to draw on top of the interface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Help,
+    Notice,
+}
+
+pub fn run(path: &Path, width: u32, height: u32, scale: f32, overlay: Overlay, touch: bool) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         .context("no graphics adapter found")?;
@@ -62,7 +70,8 @@ pub fn run(path: &Path, width: u32, height: u32, scale: f32, show_help: bool, to
         file_hover: false,
         bpm: 124.0,
         track_labels: vec!["kick".into(), "snare".into(), "hat".into(), "clap".into()],
-        help_visible: show_help,
+        help_visible: overlay == Overlay::Help,
+        notice_visible: overlay == Overlay::Notice,
         touch,
         autosave: touch,
         status: None,

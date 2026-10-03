@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Export on Android: the WAV goes to Downloads/Refraktal and the share
+  sheet opens. Android 10 and newer need no permission; Android 8 and 9 ask
+  for storage access the first time.
+- Messages on phones now show in the transport bar, where nothing covers
+  them.
+- A short note about Google's developer verification, shown once per
+  version on Android.
+
 ## 0.1.0-alpha.2
 
 - Export a project to WAV (48 kHz, 16-bit stereo) from the command line:

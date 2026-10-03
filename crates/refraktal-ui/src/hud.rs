@@ -44,6 +44,10 @@ const HELP: [(&str, &str); HELP_ROWS] = [
 pub(crate) fn queue(text: &mut TextRenderer, layout: &Layout, frame: &FrameState) {
     // The overlay dims everything behind it; text is drawn last, so hide the
     // rest of the HUD instead of letting it shine through.
+    if frame.notice_visible {
+        queue_notice(text, layout, frame);
+        return;
+    }
     if frame.help_visible {
         queue_help(text, layout, frame);
         return;
@@ -79,7 +83,8 @@ pub(crate) fn queue(text: &mut TextRenderer, layout: &Layout, frame: &FrameState
     match &frame.status {
         Some((message, alpha)) => {
             let color = [BRIGHT[0], BRIGHT[1], BRIGHT[2], alpha.clamp(0.0, 1.0)];
-            text.queue(message, sx, sy, 13.0 * s, Weight::Regular, color, Align::Center);
+            let message = fit(text, message, 13.0 * s, layout.status_width);
+            text.queue(&message, sx, sy, 13.0 * s, Weight::Regular, color, Align::Center);
         }
         None if !frame.touch => {
             text.queue("Press F1 for help", sx, sy, 13.0 * s, Weight::Regular, FAINT, Align::Center);
@@ -146,6 +151,49 @@ fn queue_help(text: &mut TextRenderer, layout: &Layout, frame: &FrameState) {
     );
     let footer_y = panel.y + panel.h - if layout.compact { 18.0 } else { 30.0 } * s;
     text.queue(&footer, left, footer_y, 12.0 * s, Weight::Regular, FAINT, Align::Left);
+}
+
+/// The note shown once per version on Android, in Refraktal's own words.
+const NOTICE: [&str; 8] = [
+    "Refraktal is free software, made by an independent developer and",
+    "published without Google's developer verification.",
+    "Google now wants every Android developer to register their identity",
+    "before apps can be installed the usual way. This began in four",
+    "countries in September 2026; Google plans to go worldwide in 2027.",
+    "I disagree: what runs on your own phone should be up to you.",
+    "If an update is ever blocked, install it with adb, or allow apps from",
+    "unverified developers in Developer options. keepandroidopen.org",
+];
+
+fn queue_notice(text: &mut TextRenderer, layout: &Layout, frame: &FrameState) {
+    let s = layout.scale;
+    let panel = layout.help;
+    let left = panel.x + if layout.compact { 28.0 } else { 44.0 } * s;
+    let (title_y, first_row) = if layout.compact { (40.0, 72.0) } else { (58.0, 108.0) };
+    text.queue("A word about Android", left, panel.y + title_y * s, 24.0 * s, Weight::Bold, BRIGHT, Align::Left);
+    for (i, line) in NOTICE.iter().enumerate() {
+        let y = panel.y + first_row * s + i as f32 * layout.help_row;
+        text.queue(line, left, y, 15.0 * s, Weight::Regular, DIM, Align::Left);
+    }
+    let footer = if frame.touch { "Tap anywhere to continue" } else { "Click anywhere to continue" };
+    let footer_y = panel.y + panel.h - if layout.compact { 18.0 } else { 30.0 } * s;
+    text.queue(footer, left, footer_y, 13.0 * s, Weight::Bold, BRIGHT, Align::Left);
+}
+
+/// Shorten `message` with an ellipsis until it fits in `width` pixels.
+fn fit(text: &TextRenderer, message: &str, size: f32, width: f32) -> String {
+    if text.measure(message, size, Weight::Regular) <= width {
+        return message.to_owned();
+    }
+    let mut chars: Vec<char> = message.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let short: String = chars.iter().collect::<String>() + "…";
+        if text.measure(&short, size, Weight::Regular) <= width {
+            return short;
+        }
+    }
+    String::new()
 }
 
 /// Shorten long names, keeping them recognizable.

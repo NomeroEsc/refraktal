@@ -94,6 +94,8 @@ pub struct Layout {
     pub transport: Rect,
     /// Glass panel holding the step grid.
     pub sequencer: Rect,
+    /// Widest a status message may be.
+    pub status_width: f32,
     /// Glass panel holding the pattern and sound rows.
     pub browser: Rect,
     /// Chips in the browser panel; the first `chip_count` are used.
@@ -263,7 +265,14 @@ impl Layout {
             label_x,
             name_x: label_x + 16.0 * s,
             bpm_anchor: (right - 136.0 * s, transport.y + pill_h * 0.5 + 7.0 * s),
-            status_anchor: (cx, sequencer.y + panel_h + k(36.0, 20.0)),
+            // Phones have no room below the grid (and system bars may cover
+            // it), so messages replace the playhead dots in the pill instead.
+            status_anchor: if compact {
+                ((dots[0] + dots[1]) * 0.5, transport.y + pill_h * 0.5 + 4.5 * s)
+            } else {
+                (cx, sequencer.y + panel_h + k(36.0, 20.0))
+            },
+            status_width: if compact { dots[1] - dots[0] + 24.0 * s } else { sequencer.w },
             help: help_rect(width, height, s, compact),
             tempo_buttons: [right - 226.0 * s, right - 114.0 * s, play_center.1, 13.0 * s],
             help_button: (right - 32.0 * s, play_center.1, 15.0 * s),
@@ -495,6 +504,14 @@ mod tests {
         assert!(layout.browser.x >= 0.0 && layout.browser.x + layout.browser.w <= 2400.0);
         assert!(layout.help.y + layout.help.h <= 1080.0);
         assert!(layout.cell >= 20.0 * 2.75, "cells too small to tap: {}", layout.cell);
+    }
+
+    #[test]
+    fn phone_messages_stay_on_screen() {
+        let layout = Layout::compute(2400.0, 1080.0, 2.75, content(MAX_TRACKS, MAX_PATTERNS));
+        let (x, y) = layout.status_anchor;
+        assert!(layout.transport.contains(x, y), "the message must sit in the transport pill");
+        assert!(layout.status_width > 100.0 * 2.75, "room for a short message");
     }
 
     #[test]

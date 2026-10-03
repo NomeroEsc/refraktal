@@ -5,10 +5,7 @@
 //! live, and feeds it the same commands the window sends when it opens a
 //! project. An export therefore sounds exactly like playback.
 
-// The Android build gets its Export button in the next step; until then
-// only the shared project helpers are used there.
-#![cfg_attr(target_os = "android", allow(dead_code))]
-
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -53,6 +50,7 @@ impl Rendered {
     }
 
     /// Length of the ring-out after the last loop.
+    #[cfg(not(target_os = "android"))]
     #[must_use]
     pub fn tail_seconds(&self) -> f32 {
         (self.frames() - self.loop_frames) as f32 / EXPORT_SAMPLE_RATE as f32
@@ -181,6 +179,7 @@ fn render_frames(engine: &mut Engine, audio: &mut Vec<f32>, frames: usize) {
 }
 
 /// Render a saved project to a WAV file. Used by `--export`.
+#[cfg(not(target_os = "android"))]
 pub fn export_file(project_path: &Path, wav_path: &Path) -> Result<Rendered> {
     let project = Project::load(project_path)?;
     let samples = load_samples(&project)?;

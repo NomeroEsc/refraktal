@@ -39,4 +39,8 @@ orientation = "sensorLandscape"
 config_changes = "orientation|screenSize|screenLayout|keyboardHidden"
 launch_mode = "singleTask"
 
-# No permissions are requested: no network, no storage, no microphone.
+# No network, no microphone. Storage access is requested only on Android
+# 8 and 9, to export into Downloads; Android 10 and newer need no permission.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+max_sdk_version = 28

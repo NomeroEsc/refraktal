@@ -42,6 +42,8 @@ pub struct FrameState {
     /// Name shown next to each track: its sound or sample file.
     pub track_labels: Vec<String>,
     pub help_visible: bool,
+    /// Whether the note about Android developer verification is open.
+    pub notice_visible: bool,
     /// Show touch instructions instead of keyboard shortcuts.
     pub touch: bool,
     /// The project is saved automatically (no save shortcuts).
@@ -387,7 +389,12 @@ impl Renderer {
             ],
             grid: [layout.grid_origin.0, layout.grid_origin.1, layout.cell, layout.gap],
             grid2: [layout.beat_gap, layout.row_gap, layout.label_x, current],
-            dots: layout.dots,
+            // On phones a message takes the dots' place; move them out of sight.
+            dots: if layout.compact && frame.status.is_some() {
+                [layout.dots[0], layout.dots[1], -1000.0, layout.dots[3]]
+            } else {
+                layout.dots
+            },
             hover: [hover_track, hover_step, hover_button, 0.0],
             pattern,
             tracks: [
@@ -398,7 +405,12 @@ impl Renderer {
             ],
             colors: [packed_colors, 0, 0, 0],
             overlay: layout.help.to_array(),
-            overlay_info: [if frame.help_visible { 1.0 } else { 0.0 }, 28.0 * layout.scale, 0.0, 0.0],
+            overlay_info: [
+                if frame.help_visible || frame.notice_visible { 1.0 } else { 0.0 },
+                28.0 * layout.scale,
+                0.0,
+                0.0,
+            ],
             tempo_buttons: layout.tempo_buttons,
             help_button: [layout.help_button.0, layout.help_button.1, layout.help_button.2, 0.0],
             export_button: [layout.export_button.0, layout.export_button.1, layout.export_button.2, 0.0],

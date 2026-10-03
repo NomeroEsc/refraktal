@@ -4,6 +4,8 @@
 //! are thin wrappers around this crate.
 
 mod audio;
+#[cfg(any(target_os = "android", test))]
+mod android_files;
 mod dialogs;
 mod export;
 mod gui;
@@ -41,6 +43,7 @@ Options:
   --size <W>x<H>            screenshot size in pixels (default 1600x1000)
   --scale <factor>          screenshot UI scale (default 1)
   --show-help               include the help overlay in the screenshot
+  --show-notice             include the Android note in the screenshot
   --touch                   screenshot the touch (phone) version of the help
   -v, --verbose             print audio device details
   -h, --help                show this help";
@@ -50,7 +53,7 @@ enum Mode {
     Gui,
     Cli,
     Export { project: PathBuf, wav: PathBuf },
-    Screenshot { path: PathBuf, width: u32, height: u32, scale: f32, show_help: bool, touch: bool },
+    Screenshot { path: PathBuf, width: u32, height: u32, scale: f32, overlay: screenshot::Overlay, touch: bool },
 }
 
 /// Desktop entry point: parse the command line and run.
@@ -61,7 +64,7 @@ pub fn run_desktop() -> Result<()> {
     let mut size = (1600_u32, 1000_u32);
     let mut scale = 1.0_f32;
     let mut screenshot_path = None;
-    let mut show_help = false;
+    let mut overlay = screenshot::Overlay::None;
     let mut touch = false;
 
     let mut args = std::env::args().skip(1);
@@ -73,7 +76,8 @@ pub fn run_desktop() -> Result<()> {
                 let wav = args.next().context("--export needs an output file, e.g. beat.wav")?;
                 mode = Mode::Export { project: PathBuf::from(project), wav: PathBuf::from(wav) };
             }
-            "--show-help" => show_help = true,
+            "--show-help" => overlay = screenshot::Overlay::Help,
+            "--show-notice" => overlay = screenshot::Overlay::Notice,
             "--touch" => touch = true,
             "-v" | "--verbose" => verbose = true,
             "--screenshot" => screenshot_path = Some(PathBuf::from(args.next().context("--screenshot needs a file name")?)),
@@ -93,12 +97,12 @@ pub fn run_desktop() -> Result<()> {
         }
     }
     if let Some(path) = screenshot_path {
-        mode = Mode::Screenshot { path, width: size.0, height: size.1, scale, show_help, touch };
+        mode = Mode::Screenshot { path, width: size.0, height: size.1, scale, overlay, touch };
     }
 
     match mode {
-        Mode::Screenshot { path, width, height, scale, show_help, touch } => {
-            screenshot::run(&path, width, height, scale, show_help, touch)
+        Mode::Screenshot { path, width, height, scale, overlay, touch } => {
+            screenshot::run(&path, width, height, scale, overlay, touch)
         }
         Mode::Export { project, wav } => {
             let rendered = export::export_file(&project, &wav)?;
@@ -140,8 +144,10 @@ pub fn run_android(app: winit::platform::android::activity::AndroidApp) -> Resul
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
     // The beat lives in the app's private storage and is saved automatically.
-    let autosave = app.internal_data_path().map(|dir| dir.join("current.refraktal"));
+    let app_dir = app.internal_data_path();
+    let autosave = app_dir.as_ref().map(|dir| dir.join("current.refraktal"));
     let audio = audio::start(false)?;
     let event_loop = winit::event_loop::EventLoop::builder().with_android_app(app).build()?;
-    gui::run(audio, event_loop, gui::Options { autosave, touch: true })
+    let notice = app_dir.map(|dir| dir.join("notice-shown"));
+    gui::run(audio, event_loop, gui::Options { autosave, touch: true, notice })
 }

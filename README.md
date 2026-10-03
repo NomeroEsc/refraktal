@@ -38,9 +38,10 @@ The binaries are not code-signed yet:
 Refraktal runs on Android 8.0 or newer (arm64), in landscape. Tap a sound
 to add a track, tap cells to edit, tap a pattern number to switch patterns
 and hold it to delete one; hold a track's dot to remove the track. Tap **?**
-for help. Your beat is saved automatically when you leave the app. The app
-requests no permissions. Exporting to WAV on Android comes in a later
-version.
+for help. Your beat is saved automatically when you leave the app. Export
+puts a WAV file in Downloads/Refraktal and opens the share sheet. The app
+has no network access; on Android 8 and 9 it asks for storage access the
+first time you export, newer versions need no permission at all.
 
 The APK is built by GitHub Actions and attached to each release. It is
 distributed outside Google Play and without Google's developer
