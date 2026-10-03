@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.3
 
-- Export on Android: the WAV goes to Downloads/Refraktal and the share
-  sheet opens. Android 10 and newer need no permission; Android 8 and 9 ask
+- Export on Android: the WAV goes to Downloads/Refraktal.
+  Android 10 and newer need no permission; Android 8 and 9 ask
   for storage access the first time.
 - Messages on phones now show in the transport bar, where nothing covers
   them.
